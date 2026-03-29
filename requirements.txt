@@ -1,0 +1,22 @@
+# openpi-client 依赖（已复制到 client/）
+dm-tree>=0.1.8
+msgpack>=1.0.5
+numpy>=1.22.4,<2.0.0
+pillow>=9.0.0
+tree>=0.2.4
+websockets>=11.0
+
+# coordinator 依赖
+fastapi>=0.110.0
+uvicorn>=0.29.0
+tyro>=0.8.0
+opencv-python>=4.9.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+
+# 相机（D435 直连）
+pyrealsense2>=2.54.0
+
+# 机械臂（已在 Docker 容器中安装，此处仅作记录）
+# frankapy
+# autolab_core
