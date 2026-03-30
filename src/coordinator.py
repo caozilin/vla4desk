@@ -1,4 +1,4 @@
-"""主控制器：20Hz 控制循环 + FastAPI WebSocket 服务。
+"""主控制器：控制循环 + FastAPI WebSocket 服务。
 
 状态机：
     IDLE    -> 保持当前位姿（静止）
@@ -35,7 +35,7 @@ DATA_DIR = pathlib.Path(__file__).parent.parent / "data" / "videos"
 
 logger = logging.getLogger(__name__)
 
-DT = 0.05  # 50ms = 20Hz
+DT = 0.05  # 推流间隔（秒），固定 20Hz
 
 
 class State(enum.Enum):
@@ -46,13 +46,15 @@ class State(enum.Enum):
 
 @dataclasses.dataclass
 class Args:
-    host: str = "0.0.0.0"       # 云端推理服务 IP（占位）
+    host: str = "100.96.2.67"    # 云端推理服务 IP（openpi，Tailscale）
     port: int = 8000             # 云端推理服务端口
     web_port: int = 8080         # 本地 Web 前端端口
     cam1_serial: str | None = None   # 外部相机 serial（占位）
     cam2_serial: str | None = None   # 腕部相机 serial（占位）
     api_key: str | None = None   # 推理服务 API key（若有）
     replan_steps: int = 5        # 每次推理取几步 action 执行
+    no_robot: bool = False       # 不启动 FrankaArm（机械臂未连接时使用）
+    control_hz: float = 10.0     # 控制循环频率（Hz），与 skill loop 对齐
 
 
 class Coordinator:
@@ -76,16 +78,27 @@ class Coordinator:
         self._latest_img2: np.ndarray | None = None
         self._frame_lock = threading.Lock()
 
+        # 最新 state / action（供前端显示）
+        self._latest_state: list | None = None
+        self._latest_action: list | None = None
+        self._latest_infer_ms: float | None = None
+        self._latest_prev_total_ms: float | None = None
+        self._telemetry_lock = threading.Lock()
+
         # WebSocket 客户端集合
         self._ws_clients: set[WebSocket] = set()
         self._ws_lock = asyncio.Lock()
 
-        self._env = FrankaEnv(args.cam1_serial, args.cam2_serial)
-        self._client = _websocket_client_policy.WebsocketClientPolicy(
-            host=args.host,
-            port=args.port,
-            api_key=args.api_key,
-        )
+        self._env = FrankaEnv(args.cam1_serial, args.cam2_serial, no_robot=args.no_robot)
+        try:
+            self._client = _websocket_client_policy.WebsocketClientPolicy(
+                host=args.host,
+                port=args.port,
+                api_key=args.api_key,
+            )
+        except Exception as e:
+            logger.warning(f"推理服务连接失败，推理功能不可用：{e}")
+            self._client = None
 
     # ------------------------------------------------------------------
     # 状态机控制（供 REST API 调用）
@@ -135,8 +148,8 @@ class Coordinator:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path1 = DATA_DIR / f"recording_{ts}_cam1.mp4"
         path2 = DATA_DIR / f"recording_{ts}_cam2.mp4"
-        imageio.mimwrite(str(path1), frames1, fps=20)
-        imageio.mimwrite(str(path2), frames2, fps=20)
+        imageio.mimwrite(str(path1), frames1, fps=20, codec="libx264", pixelformat="yuv420p")
+        imageio.mimwrite(str(path2), frames2, fps=20, codec="libx264", pixelformat="yuv420p")
         logger.info(f"Recording saved: {path1}, {path2} ({len(frames1)} frames)")
         return {"cam1": str(path1), "cam2": str(path2)}
 
@@ -146,13 +159,14 @@ class Coordinator:
             return self._state
 
     # ------------------------------------------------------------------
-    # 20Hz 控制循环（在独立线程中运行）
+    # 控制循环（在独立线程中运行）
     # ------------------------------------------------------------------
 
     def run_control_loop(self):
+        dt = 1.0 / self._args.control_hz
         self._env.start()
-        self._env.start_dynamic_skill()
-        logger.info("Control loop started at 20Hz")
+        self._env.start_skill_thread()
+        logger.info("Control loop started (skill thread running at 10Hz)")
 
         while True:
             t_start = time.time()
@@ -163,7 +177,7 @@ class Coordinator:
                 logger.error(f"Control loop error: {e}", exc_info=True)
 
             elapsed = time.time() - t_start
-            sleep_time = DT - elapsed
+            sleep_time = dt - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
             else:
@@ -183,6 +197,10 @@ class Coordinator:
             self._latest_img1 = img1_raw
             self._latest_img2 = img2_raw
 
+        # 缓存最新 state
+        with self._telemetry_lock:
+            self._latest_state = obs["observation/state"].tolist()
+
         # 录屏：分别保存双路图像帧
         if self._recording and img1_raw is not None and img2_raw is not None:
             self._record_frames1.append(img1_raw.copy())
@@ -191,21 +209,36 @@ class Coordinator:
         if current_state == State.RUNNING:
             # action_plan 耗尽时推理
             if not self._action_plan:
-                action_chunk = self._client.infer(obs)["actions"]
+                if self._client is None:
+                    logger.warning("推理服务不可用，跳过推理")
+                    with self._state_lock:
+                        self._state = State.IDLE
+                    return
+                t0 = time.time()
+                result = self._client.infer(obs)
+                prev_total_ms = (time.time() - t0) * 1000
+                action_chunk = result["actions"]
+                timing = result.get("server_timing", {})
+                infer_ms = timing.get("infer_ms", None)
+                with self._telemetry_lock:
+                    self._latest_infer_ms = infer_ms
+                    self._latest_prev_total_ms = prev_total_ms
                 self._action_plan.extend(action_chunk[:self._args.replan_steps])
 
             action = self._action_plan.popleft()  # (7,)
-            self._env.apply_action(action)
+            self._env.enqueue_action(action)
+            with self._telemetry_lock:
+                self._latest_action = action.tolist()
 
         elif current_state == State.HOMING:
             self._env.reset_to_home()
-            self._env.start_dynamic_skill()
+            self._env.start_skill_thread()
             with self._state_lock:
                 self._state = State.IDLE
             logger.info("Homing complete, State -> IDLE")
 
         else:  # IDLE
-            self._env.hold_current_pose()
+            self._env.hold_pose()
 
     # ------------------------------------------------------------------
     # 前端图像推流
@@ -293,10 +326,21 @@ def build_app(coordinator: Coordinator) -> FastAPI:
 
     @app.get("/status")
     async def status():
+        with coordinator._telemetry_lock:
+            latest_state = coordinator._latest_state
+            latest_action = coordinator._latest_action
+            latest_infer_ms = coordinator._latest_infer_ms
+            latest_prev_total_ms = coordinator._latest_prev_total_ms
         return {
             "state": coordinator.state.value,
             "recording": coordinator._recording,
             "prompt": coordinator._prompt,
+            "robot_connected": coordinator._env._fa is not None,
+            "server_connected": coordinator._client is not None,
+            "latest_state": latest_state,
+            "latest_action": latest_action,
+            "infer_ms": latest_infer_ms,
+            "prev_total_ms": latest_prev_total_ms,
         }
 
     @app.websocket("/ws/frames")

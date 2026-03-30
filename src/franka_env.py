@@ -7,12 +7,17 @@ obs 格式（发给 openpi 服务端）：
     prompt                  : str
 
 action 格式（从 openpi 服务端接收）：
-    actions : (5, 7) float64  [delta_pos(3), delta_axisangle(3), gripper(1)]
+    actions : (H, 7) float64  [delta_pos(3), delta_axisangle(3), gripper(1)]
 """
+import logging
 import math
 import pathlib
+import queue
 import sys
 import threading
+import time
+
+logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "client"))
 
@@ -24,7 +29,8 @@ try:
     from frankapy import FrankaArm, SensorDataMessageType
     from frankapy import FrankaConstants as FC
     from frankapy.proto_utils import sensor_proto2ros_msg, make_sensor_group_msg
-    from frankapy.proto import PosePositionSensorMessage, ShouldTerminateSensorMessage
+    from frankapy.proto import PosePositionSensorMessage, ShouldTerminateSensorMessage, CartesianImpedanceSensorMessage
+    from frankapy.utils import min_jerk_weight
     HAS_FRANKA = True
 except ImportError:
     HAS_FRANKA = False
@@ -49,27 +55,61 @@ class D435Camera:
     def start(self):
         if not HAS_REALSENSE:
             raise RuntimeError("pyrealsense2 未安装，无法启动相机")
-        self._pipeline = rs.pipeline()
-        cfg = rs.config()
+        config = rs.config()
         if self._serial:
-            cfg.enable_device(self._serial)
-        cfg.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
-        self._pipeline.start(cfg)
-        for _ in range(5):  # 预热
-            self._pipeline.wait_for_frames()
+            config.enable_device(self._serial)
+        config.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
+        self._pipeline = rs.pipeline()
+        self._pipeline.start(config)
+
+    def get_frame(self) -> np.ndarray:
+        frames = self._pipeline.wait_for_frames()
+        color = frames.get_color_frame()
+        return np.asanyarray(color.get_data())
 
     def stop(self):
-        if self._pipeline:
+        if self._pipeline is not None:
             self._pipeline.stop()
             self._pipeline = None
 
-    def get_frame(self) -> np.ndarray:
-        """返回最新一帧 RGB 图像 (H, W, 3) uint8。"""
-        frames = self._pipeline.wait_for_frames(timeout_ms=1000)
-        color = frames.get_color_frame()
-        if not color:
-            raise RuntimeError("D435 未返回彩色帧")
-        return np.asanyarray(color.get_data())
+
+class DualD435:
+    """双路 D435 封装，某路 serial 为 None 或启动失败时返回全黑帧。"""
+
+    def __init__(self, cam1_serial: str | None = None, cam2_serial: str | None = None):
+        self._cam1 = D435Camera(cam1_serial)
+        self._cam2 = D435Camera(cam2_serial)
+        self._black = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def start(self):
+        for cam in (self._cam1, self._cam2):
+            try:
+                cam.start()
+            except Exception as e:
+                logger.warning(f"相机启动失败，将使用全黑帧：{e}")
+
+    def stop(self):
+        for cam in (self._cam1, self._cam2):
+            try:
+                cam.stop()
+            except Exception:
+                pass
+
+    def get_frames(self) -> tuple[np.ndarray, np.ndarray]:
+        """返回 (frame1, frame2)，某路不可用时返回全黑帧。"""
+        frames = []
+        for cam in (self._cam1, self._cam2):
+            if cam._pipeline is None:
+                frames.append(self._black.copy())
+            else:
+                try:
+                    frames.append(cam.get_frame())
+                except Exception as e:
+                    logger.warning(f"相机读帧失败，返回全黑帧：{e}")
+                    cam._pipeline = None
+                    frames.append(self._black.copy())
+        return frames[0], frames[1]
+
 
 RESIZE = 224
 
@@ -86,6 +126,11 @@ def quat2axisangle(quat: np.ndarray) -> np.ndarray:
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
+CONTROL_DT = 0.1   # 10Hz：每个 action 的执行周期
+INTERP_DT = 0.02   # 50Hz：每次 sensor message 间隔（与示例一致）
+INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
+
+
 class FrankaEnv:
     """封装机械臂状态读取与 dynamic pose 控制。"""
 
@@ -93,18 +138,23 @@ class FrankaEnv:
         self,
         cam1_serial: str | None = None,
         cam2_serial: str | None = None,
-        dynamic_duration: float = 60.0,  # dynamic skill 的持续时长（秒），可按需调大
+        dynamic_duration: float = 60.0,
+        no_robot: bool = False,
     ):
-        if not HAS_FRANKA:
-            raise RuntimeError("frankapy 未安装")
+        if no_robot or not HAS_FRANKA:
+            if not no_robot:
+                logger.warning("frankapy 未安装")
+            self._fa = None
+        else:
+            self._fa = FrankaArm()
 
-        self._fa = FrankaArm()
         self._cameras = DualD435(cam1_serial, cam2_serial)
         self._dynamic_duration = dynamic_duration
 
-        self._in_dynamic = False
-        self._init_time: float = 0.0
-        self._msg_id: int = 0
+        # 动作队列：coordinator 往里放 action，_skill_thread 消费
+        self._action_queue: queue.Queue = queue.Queue()
+        self._skill_thread: threading.Thread | None = None
+        self._skill_stop = threading.Event()
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -115,12 +165,15 @@ class FrankaEnv:
         self._cameras.start()
 
     def stop(self):
-        self._end_dynamic_skill()
+        self._stop_skill_thread()
         self._cameras.stop()
 
     def reset_to_home(self):
-        """结束 dynamic skill，回到 home 位姿。"""
-        self._end_dynamic_skill()
+        """结束 dynamic skill 线程，回到 home 位姿。"""
+        if self._fa is None:
+            logger.warning("机械臂不可用，跳过 reset_to_home")
+            return
+        self._stop_skill_thread()
         self._fa.reset_joints()
 
     # ------------------------------------------------------------------
@@ -137,15 +190,17 @@ class FrankaEnv:
             image_tools.resize_with_pad(img2, RESIZE, RESIZE)
         )
 
-        pose = self._fa.get_pose()  # RigidTransform
-        gripper = self._fa.get_gripper_width()  # float (m)
-
-        state = np.concatenate([
-            pose.translation,                    # (3,) eef pos
-            quat2axisangle(pose.quaternion),     # (3,) eef rotation
-            [gripper],                           # (1,) gripper width
-            [0.0],                               # (1,) 占位，与 libero state (8,) 对齐
-        ])
+        if self._fa is not None:
+            pose = self._fa.get_pose()  # RigidTransform
+            gripper = self._fa.get_gripper_width()  # float (m)
+            state = np.concatenate([
+                pose.translation,                    # (3,) eef pos
+                quat2axisangle(pose.quaternion),     # (3,) eef rot
+                [gripper],                           # (1,) gripper
+                [0.0],                               # (1,) 占位，与 libero state (8,) 对齐
+            ])
+        else:
+            state = np.zeros(8, dtype=np.float64)
 
         return {
             "observation/image": img1_resized,
@@ -158,96 +213,114 @@ class FrankaEnv:
     # action 执行
     # ------------------------------------------------------------------
 
-    def start_dynamic_skill(self):
-        """启动 dynamic pose skill（非阻塞），在控制循环开始前调用一次。"""
-        if self._in_dynamic:
+    def start_skill_thread(self):
+        """启动 dynamic skill 执行线程（如已在运行则忽略）。"""
+        with self._lock:
+            if self._skill_thread is not None and self._skill_thread.is_alive():
+                return
+            self._skill_stop.clear()
+            self._skill_thread = threading.Thread(
+                target=self._skill_loop, daemon=True
+            )
+            self._skill_thread.start()
+
+    def _stop_skill_thread(self):
+        """停止 dynamic skill 执行线程，等待其退出。"""
+        self._skill_stop.set()
+        # 放一个哨兵让线程从阻塞的 get 中醒来
+        self._action_queue.put(None)
+        if self._skill_thread is not None:
+            self._skill_thread.join(timeout=3.0)
+            self._skill_thread = None
+
+    def _skill_loop(self):
+        """
+        完全仿照 run_dynamic_pose.py 的 for 循环模式：
+        1. goto_pose 启动 dynamic skill
+        2. 循环从队列取 action，计算 target pose，publish sensor message
+        3. 收到停止信号后发送 ShouldTerminate
+        """
+        if self._fa is None:
             return
-        current_pose = self._fa.get_pose()
-        self._fa.goto_pose(
+
+        fa = self._fa
+        current_pose = fa.get_pose()
+
+        logger.info("启动 dynamic skill...")
+        fa.goto_pose(
             current_pose,
             duration=self._dynamic_duration,
             dynamic=True,
             buffer_time=10,
         )
-        self._init_time = self._fa.get_time()
-        self._msg_id = 0
-        self._in_dynamic = True
+        init_time = fa.get_time()
+        msg_id = 0
+        # 维护指令位姿（commanded pose），在其基础上叠加 delta，而非实际位姿
+        commanded_pose = current_pose.copy()
+        logger.info("dynamic skill 就绪，开始接收 action")
 
-    def apply_action(self, action: np.ndarray):
-        """执行单步 action (7,): [delta_pos(3), delta_axisangle(3), gripper(1)]。"""
-        if not self._in_dynamic:
-            self.start_dynamic_skill()
+        last_gripper: float | None = None
 
-        current_pose = self._fa.get_pose()
-        target_pose = self._compute_target_pose(current_pose, action[:6])
+        while not self._skill_stop.is_set():
+            try:
+                action = self._action_queue.get(timeout=CONTROL_DT * 2)
+            except queue.Empty:
+                action = None
 
-        self._msg_id += 1
-        timestamp = self._fa.get_time() - self._init_time
+            if action is None:
+                if self._skill_stop.is_set():
+                    break
+                # 超时/保持：以 min_jerk 插值维持在当前指令位姿
+                start_pose = commanded_pose
+                goal_pose = commanded_pose
+            else:
+                action = action.copy()
+                action[:3] = np.clip(action[:3], -0.005, 0.005)
+                action[3:6] = np.clip(action[3:6], -0.01, 0.01)
+                start_pose = commanded_pose
+                commanded_pose = self._compute_target_pose(commanded_pose, action[:6])
+                goal_pose = commanded_pose
 
-        proto_msg = PosePositionSensorMessage(
-            id=self._msg_id,
-            timestamp=timestamp,
-            position=target_pose.translation,
-            quaternion=target_pose.quaternion,
-        )
-        ros_msg = make_sensor_group_msg(
-            trajectory_generator_sensor_msg=sensor_proto2ros_msg(
-                proto_msg, SensorDataMessageType.POSE_POSITION
-            )
-        )
-        self._fa.publish_sensor_data(ros_msg)
+                # 夹爪：变化超过 5mm 才发送
+                gripper_cmd = float(np.clip(action[6], 0.0, 0.08))
+                if last_gripper is None or abs(gripper_cmd - last_gripper) > 0.005:
+                    fa.goto_gripper(gripper_cmd, block=False)
+                    last_gripper = gripper_cmd
 
-        # 夹爪控制（非阻塞）
-        target_gripper = float(np.clip(action[6], 0.0, 0.08))
-        self._fa.goto_gripper(target_gripper, block=False)
+            # 在 CONTROL_DT 内以 INTERP_DT 为间隔用 min_jerk 插值发送
+            ts = np.arange(INTERP_DT, CONTROL_DT + INTERP_DT * 0.5, INTERP_DT)
+            for t in ts:
+                if self._skill_stop.is_set():
+                    break
+                w = min_jerk_weight(t, CONTROL_DT)
+                interp_pose = goal_pose.interpolate_with(start_pose, 1.0 - w)
+                msg_id += 1
+                timestamp = fa.get_time() - init_time
+                traj_proto = PosePositionSensorMessage(
+                    id=msg_id,
+                    timestamp=timestamp,
+                    position=interp_pose.translation,
+                    quaternion=interp_pose.quaternion,
+                )
+                impedance_proto = CartesianImpedanceSensorMessage(
+                    id=msg_id,
+                    timestamp=timestamp,
+                    translational_stiffnesses=FC.DEFAULT_TRANSLATIONAL_STIFFNESSES,
+                    rotational_stiffnesses=FC.DEFAULT_ROTATIONAL_STIFFNESSES,
+                )
+                ros_msg = make_sensor_group_msg(
+                    trajectory_generator_sensor_msg=sensor_proto2ros_msg(
+                        traj_proto, SensorDataMessageType.POSE_POSITION
+                    ),
+                    feedback_controller_sensor_msg=sensor_proto2ros_msg(
+                        impedance_proto, SensorDataMessageType.CARTESIAN_IMPEDANCE
+                    ),
+                )
+                fa.publish_sensor_data(ros_msg)
+                time.sleep(INTERP_DT)
 
-    def hold_current_pose(self):
-        """发送当前位姿作为目标，实现静止保持。"""
-        if not self._in_dynamic:
-            self.start_dynamic_skill()
-            return
-
-        current_pose = self._fa.get_pose()
-        self._msg_id += 1
-        timestamp = self._fa.get_time() - self._init_time
-
-        proto_msg = PosePositionSensorMessage(
-            id=self._msg_id,
-            timestamp=timestamp,
-            position=current_pose.translation,
-            quaternion=current_pose.quaternion,
-        )
-        ros_msg = make_sensor_group_msg(
-            trajectory_generator_sensor_msg=sensor_proto2ros_msg(
-                proto_msg, SensorDataMessageType.POSE_POSITION
-            )
-        )
-        self._fa.publish_sensor_data(ros_msg)
-
-    # ------------------------------------------------------------------
-    # 内部工具
-    # ------------------------------------------------------------------
-
-    def _compute_target_pose(self, current: "RigidTransform", delta: np.ndarray) -> "RigidTransform":
-        """将 delta [dx,dy,dz, dax,day,daz] 叠加到当前位姿。"""
-        delta_translation = delta[:3]
-        delta_axisangle = delta[3:6]
-        angle = np.linalg.norm(delta_axisangle)
-
-        target = current.copy()
-        target.translation = current.translation + delta_translation
-
-        if angle > 1e-6:
-            axis = delta_axisangle / angle
-            delta_rot = RigidTransform.rotation_from_axes(axis, angle)
-            target.rotation = delta_rot @ current.rotation
-
-        return target
-
-    def _end_dynamic_skill(self):
-        if not self._in_dynamic:
-            return
-        timestamp = self._fa.get_time() - self._init_time
+        # 发送终止消息
+        timestamp = fa.get_time() - init_time
         term_msg = ShouldTerminateSensorMessage(
             timestamp=timestamp, should_terminate=True
         )
@@ -256,5 +329,35 @@ class FrankaEnv:
                 term_msg, SensorDataMessageType.SHOULD_TERMINATE
             )
         )
-        self._fa.publish_sensor_data(ros_msg)
-        self._in_dynamic = False
+        fa.publish_sensor_data(ros_msg)
+        logger.info("dynamic skill 已终止")
+
+    def enqueue_action(self, action: np.ndarray):
+        """外部调用：将一个 action 放入队列，由 _skill_loop 消费。"""
+        self._action_queue.put(action)
+
+    def hold_pose(self):
+        """外部调用：放一个 None 进队列，让 _skill_loop 保持当前位姿一拍。"""
+        # 队列非空时不重复放，避免积压
+        if self._action_queue.empty():
+            self._action_queue.put(None)
+
+    # ------------------------------------------------------------------
+    # 内部工具
+    # ------------------------------------------------------------------
+
+    def _compute_target_pose(self, current: "RigidTransform", delta: np.ndarray) -> "RigidTransform":
+        """将 delta [dx,dy,dz,dax,day,daz] 叠加到当前位姿。"""
+        from scipy.spatial.transform import Rotation
+        delta_translation = delta[:3].copy()
+        delta_axisangle = delta[3:6].copy()
+
+        target = current.copy()
+        target.translation = current.translation + delta_translation
+
+        angle = np.linalg.norm(delta_axisangle)
+        if angle > 1e-6:
+            delta_rot = Rotation.from_rotvec(delta_axisangle).as_matrix()
+            target.rotation = delta_rot @ current.rotation
+
+        return target

@@ -46,6 +46,25 @@
   }
   #rec-indicator.active { background: #f44; animation: blink 1s infinite; }
   @keyframes blink { 50% { opacity: 0.3; } }
+  .conn-dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background: #555; margin-left: 6px;
+    vertical-align: middle;
+  }
+  .conn-dot.on { background: #4f4; }
+  .conn-label { font-size: 0.75rem; color: #888; margin-left: 12px; }
+  .telemetry {
+    display: flex; gap: 12px; margin-top: 10px;
+    font-size: 0.75rem; color: #888;
+  }
+  .tele-box {
+    flex: 1; background: #222; border: 1px solid #333;
+    border-radius: 4px; padding: 6px 8px;
+  }
+  .tele-box label { color: #666; display: block; margin-bottom: 4px; }
+  .tele-row { display: flex; justify-content: space-between; }
+  .tele-key { color: #666; }
+  .tele-val { color: #cde; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -78,6 +97,25 @@
 <div class="status-bar">
   状态：<span id="state-badge" class="state-idle">idle</span>
   <span id="rec-indicator" title="录屏中"></span>
+  <span class="conn-label">机械臂<span id="dot-robot" class="conn-dot" title="机械臂"></span></span>
+  <span class="conn-label">推理服务<span id="dot-server" class="conn-dot" title="推理服务"></span></span>
+</div>
+
+<div class="telemetry">
+  <div class="tele-box" id="tele-state-box" style="display:none">
+    <label>State（机械臂）</label>
+    <div class="tele-row"><span class="tele-key">pos xyz</span><span class="tele-val" id="tele-pos">—</span></div>
+    <div class="tele-row"><span class="tele-key">rot axisangle</span><span class="tele-val" id="tele-rot">—</span></div>
+    <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-grip">—</span></div>
+  </div>
+  <div class="tele-box" id="tele-action-box" style="display:none">
+    <label>Action（上一步）</label>
+    <div class="tele-row"><span class="tele-key">Δpos xyz</span><span class="tele-val" id="tele-apos">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δrot axisangle</span><span class="tele-val" id="tele-arot">—</span></div>
+    <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-agrip">—</span></div>
+    <div class="tele-row"><span class="tele-key">推理耗时</span><span class="tele-val" id="tele-infer-ms">—</span></div>
+    <div class="tele-row"><span class="tele-key">总耗时</span><span class="tele-val" id="tele-total-ms">—</span></div>
+  </div>
 </div>
 
 <script>
@@ -85,6 +123,8 @@ const img1 = document.getElementById('img1');
 const img2 = document.getElementById('img2');
 const stateBadge = document.getElementById('state-badge');
 const recIndicator = document.getElementById('rec-indicator');
+const dotRobot = document.getElementById('dot-robot');
+const dotServer = document.getElementById('dot-server');
 
 // --- WebSocket 图像流 ---
 const ws = new WebSocket(`ws://${location.host}/ws/frames`);
@@ -145,9 +185,38 @@ async function pollStatus() {
   } else {
     recIndicator.classList.remove('active');
   }
+  dotRobot.classList.toggle('on', !!data.robot_connected);
+  dotServer.classList.toggle('on', !!data.server_connected);
+
+  const stateBox = document.getElementById('tele-state-box');
+  const actionBox = document.getElementById('tele-action-box');
+  stateBox.style.display = data.robot_connected ? '' : 'none';
+  actionBox.style.display = data.server_connected ? '' : 'none';
+
+  const fmt = (v) => v.toFixed(4);
+  const fmtArr = (arr) => arr.map(fmt).join('  ');
+
+  if (data.robot_connected && data.latest_state) {
+    const s = data.latest_state;
+    document.getElementById('tele-pos').textContent  = fmtArr(s.slice(0,3));
+    document.getElementById('tele-rot').textContent  = fmtArr(s.slice(3,6));
+    document.getElementById('tele-grip').textContent = fmt(s[6]);
+  }
+  if (data.server_connected && data.latest_action) {
+    const a = data.latest_action;
+    document.getElementById('tele-apos').textContent  = fmtArr(a.slice(0,3));
+    document.getElementById('tele-arot').textContent  = fmtArr(a.slice(3,6));
+    document.getElementById('tele-agrip').textContent = fmt(a[6]);
+  }
+  if (data.infer_ms != null) {
+    document.getElementById('tele-infer-ms').textContent = data.infer_ms.toFixed(1) + ' ms';
+  }
+  if (data.prev_total_ms != null) {
+    document.getElementById('tele-total-ms').textContent = data.prev_total_ms.toFixed(1) + ' ms';
+  }
 }
 
-setInterval(pollStatus, 1000);
+setInterval(pollStatus, 333);
 pollStatus();
 </script>
 </body>

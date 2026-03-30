@@ -40,12 +40,12 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         """Get server metadata. / 获取服务器元数据。"""
         return self._server_metadata
 
-    def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
+    def _wait_for_server(self, max_retries: int = 3) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         """Wait for server connection and return connection with metadata.
         / 等待服务器连接并返回连接和元数据。
         """
         logging.info(f"Waiting for server at {self._uri}...")
-        while True:
+        for attempt in range(max_retries):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
@@ -53,9 +53,11 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
-            except ConnectionRefusedError:
-                logging.info("Still waiting for server...")
-                time.sleep(5)
+            except Exception:
+                logging.info(f"Still waiting for server... ({attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+        raise ConnectionRefusedError(f"无法连接推理服务 {self._uri}，已重试 {max_retries} 次")
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
