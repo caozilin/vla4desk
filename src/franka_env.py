@@ -3,7 +3,7 @@
 obs 格式（发给 openpi 服务端）：
     observation/image       : (224, 224, 3) uint8  外部相机
     observation/wrist_image : (224, 224, 3) uint8  腕部相机
-    observation/state       : (8,) float64  [eef_pos(3), eef_axisangle(3), gripper(1), 0]
+    observation/state       : (8,) float64  [eef_pos(3), eef_axisangle(3), finger1_qpos(1), finger2_qpos(1)]
     prompt                  : str
 
 action 格式（从 openpi 服务端接收）：
@@ -40,6 +40,23 @@ try:
     HAS_REALSENSE = True
 except ImportError:
     HAS_REALSENSE = False
+
+
+from scipy.spatial.transform import Rotation
+
+POS_CLIP = 0.05
+ROT_CLIP = 0.5
+POS_SCALE = 1.0
+ROT_SCALE = 1.0
+
+
+def transform_action(action: np.ndarray) -> np.ndarray:
+    """将原始 action [7] 裁剪并缩放为机器人可执行的指令。"""
+    ta = action.copy()
+    ta[:3] = np.clip(ta[:3], -POS_CLIP, POS_CLIP) * POS_SCALE
+    ta[3:6] = np.clip(ta[3:6], -ROT_CLIP, ROT_CLIP) * ROT_SCALE
+    ta[6] = 0.0 if ta[6] >= 0 else 0.08
+    return ta
 
 
 class D435Camera:
@@ -126,9 +143,19 @@ def quat2axisangle(quat: np.ndarray) -> np.ndarray:
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
-CONTROL_DT = 0.1   # 10Hz：每个 action 的执行周期
+CONTROL_DT = 0.1   # 每个 action 的执行周期（s），决定控制频率
 INTERP_DT = 0.02   # 50Hz：每次 sensor message 间隔（与示例一致）
 INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
+
+# Action 缩放超参数
+POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
+ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
+POS_MAX_VEL = 0.1       # 末端位置最大速度 (m/s)
+ROT_MAX_VEL = math.pi   # 末端旋转最大速度 (rad/s)
+GRIPPER_SPEED = 0.08    # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
+# 由超参数推导的每步缩放系数（当 action=clip 上限时，delta = MAX_VEL × CONTROL_DT）
+POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
+ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
 
 
 class FrankaEnv:
@@ -156,6 +183,7 @@ class FrankaEnv:
         self._skill_thread: threading.Thread | None = None
         self._skill_stop = threading.Event()
         self._lock = threading.Lock()
+        self._commanded_pose_array = np.zeros(6)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -192,12 +220,13 @@ class FrankaEnv:
 
         if self._fa is not None:
             pose = self._fa.get_pose()  # RigidTransform
-            gripper = self._fa.get_gripper_width()  # float (m)
+            joints = self._fa.get_joints()  # (7,) 关节角度
+            half = self._fa.get_gripper_width() / 2.0  # 单指开口(m)
             state = np.concatenate([
                 pose.translation,                    # (3,) eef pos
                 quat2axisangle(pose.quaternion),     # (3,) eef rot
-                [gripper],                           # (1,) gripper
-                [0.0],                               # (1,) 占位，与 libero state (8,) 对齐
+                [+half],                             # (1,) finger1 qpos，对应 libero robot0_gripper_qpos[0]
+                [-half],                             # (1,) finger2 qpos，对应 libero robot0_gripper_qpos[1]
             ])
         else:
             state = np.zeros(8, dtype=np.float64)
@@ -206,6 +235,7 @@ class FrankaEnv:
             "observation/image": img1_resized,
             "observation/wrist_image": img2_resized,
             "observation/state": state.astype(np.float64),
+            "observation/joints": joints.astype(np.float64),
             "prompt": prompt,
         }, img1, img2  # 同时返回原始帧供前端推流和录屏
 
@@ -274,18 +304,22 @@ class FrankaEnv:
                 start_pose = commanded_pose
                 goal_pose = commanded_pose
             else:
-                action = action.copy()
-                action[:3] = np.clip(action[:3], -0.005, 0.005)
-                action[3:6] = np.clip(action[3:6], -0.01, 0.01)
+                # 使用统一的变换逻辑
+                action = transform_action(action)
+
                 start_pose = commanded_pose
                 commanded_pose = self._compute_target_pose(commanded_pose, action[:6])
                 goal_pose = commanded_pose
 
-                # 夹爪：变化超过 5mm 才发送
-                gripper_cmd = float(np.clip(action[6], 0.0, 0.08))
-                if last_gripper is None or abs(gripper_cmd - last_gripper) > 0.005:
-                    fa.goto_gripper(gripper_cmd, block=False)
-                    last_gripper = gripper_cmd
+                # 更新指令位姿缓存供外部（Coordinator）读取用于前端显示
+                rot_vec = Rotation.from_matrix(commanded_pose.rotation).as_rotvec()
+                self._commanded_pose_array = np.concatenate([commanded_pose.translation, rot_vec])
+
+                # 夹爪二值化逻辑已在 transform_action 中处理
+                gripper_target = action[6]
+                if last_gripper is None or gripper_target != last_gripper:
+                    fa.goto_gripper(gripper_target, block=False, speed=GRIPPER_SPEED)
+                    last_gripper = gripper_target
 
             # 在 CONTROL_DT 内以 INTERP_DT 为间隔用 min_jerk 插值发送
             ts = np.arange(INTERP_DT, CONTROL_DT + INTERP_DT * 0.5, INTERP_DT)
@@ -342,13 +376,16 @@ class FrankaEnv:
         if self._action_queue.empty():
             self._action_queue.put(None)
 
+    @property
+    def commanded_pose_array(self) -> np.ndarray:
+        return self._commanded_pose_array
+
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
 
     def _compute_target_pose(self, current: "RigidTransform", delta: np.ndarray) -> "RigidTransform":
         """将 delta [dx,dy,dz,dax,day,daz] 叠加到当前位姿。"""
-        from scipy.spatial.transform import Rotation
         delta_translation = delta[:3].copy()
         delta_axisangle = delta[3:6].copy()
 

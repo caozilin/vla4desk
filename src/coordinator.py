@@ -11,6 +11,7 @@ import collections
 import dataclasses
 import enum
 import io
+import json
 import logging
 import pathlib
 import sys
@@ -29,9 +30,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import websocket_client_policy as _websocket_client_policy
 
-from franka_env import FrankaEnv
+from franka_env import FrankaEnv, transform_action
 
-DATA_DIR = pathlib.Path(__file__).parent.parent / "data" / "videos"
+LOGS_BASE_DIR = pathlib.Path(__file__).parent.parent / "logs"
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class Args:
     replan_steps: int = 5        # 每次推理取几步 action 执行
     no_robot: bool = False       # 不启动 FrankaArm（机械臂未连接时使用）
     control_hz: float = 10.0     # 控制循环频率（Hz），与 skill loop 对齐
+    telemetry_hz: float = 3.0    # 遥测记录与展示频率 (Hz)
 
 
 class Coordinator:
@@ -72,6 +74,10 @@ class Coordinator:
         self._recording = False
         self._record_frames1: list[np.ndarray] = []
         self._record_frames2: list[np.ndarray] = []
+        self._telemetry_log: list[dict] = []
+        self._session_dir: pathlib.Path | None = None
+        self._last_tele_log_time = 0.0
+        self._record_lock = threading.Lock()
 
         # 最新帧（供 WebSocket 推流）
         self._latest_img1: np.ndarray | None = None
@@ -80,7 +86,10 @@ class Coordinator:
 
         # 最新 state / action（供前端显示）
         self._latest_state: list | None = None
+        self._latest_joints: list | None = None
+        self._latest_target_pose: list | None = None
         self._latest_action: list | None = None
+        self._latest_action_transformed: list | None = None
         self._latest_infer_ms: float | None = None
         self._latest_prev_total_ms: float | None = None
         self._telemetry_lock = threading.Lock()
@@ -129,29 +138,52 @@ class Coordinator:
             self._prompt = prompt
             logger.info(f"Prompt updated: {prompt}")
 
-    def cmd_start_record(self):
-        self._record_frames1.clear()
-        self._record_frames2.clear()
-        self._recording = True
-        logger.info("Recording started")
+    def _start_session_logging(self):
+        with self._record_lock:
+            self._record_frames1.clear()
+            self._record_frames2.clear()
+            self._telemetry_log.clear()
+            self._session_dir = LOGS_BASE_DIR / time.strftime("%Y%m%d_%H%M%S")
+            self._session_dir.mkdir(parents=True, exist_ok=True)
+            self._recording = True
+            self._last_tele_log_time = 0.0
+        logger.info(f"Auto-recording started: {self._session_dir}")
 
-    def cmd_stop_record(self):
-        self._recording = False
-        frames1 = self._record_frames1.copy()
-        frames2 = self._record_frames2.copy()
-        self._record_frames1.clear()
-        self._record_frames2.clear()
-        if not frames1:
-            return None
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        import datetime
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path1 = DATA_DIR / f"recording_{ts}_cam1.mp4"
-        path2 = DATA_DIR / f"recording_{ts}_cam2.mp4"
-        imageio.mimwrite(str(path1), frames1, fps=20, codec="libx264", pixelformat="yuv420p")
-        imageio.mimwrite(str(path2), frames2, fps=20, codec="libx264", pixelformat="yuv420p")
-        logger.info(f"Recording saved: {path1}, {path2} ({len(frames1)} frames)")
-        return {"cam1": str(path1), "cam2": str(path2)}
+    def _stop_session_logging(self):
+        with self._record_lock:
+            self._recording = False
+            frames1 = self._record_frames1[:]
+            frames2 = self._record_frames2[:]
+            tele_log = self._telemetry_log[:]
+            self._record_frames1.clear()
+            self._record_frames2.clear()
+            self._telemetry_log.clear()
+            session_dir = self._session_dir
+
+        if not frames1 or session_dir is None:
+            return
+
+        def _save():
+            try:
+                path1 = session_dir / "cam1.mp4"
+                path2 = session_dir / "cam2.mp4"
+                path_tele = session_dir / "telemetry.jsonl"
+
+                # 保存视频 (与 control_hz 对齐)
+                fps = self._args.control_hz
+                imageio.mimwrite(str(path1), frames1, fps=fps, codec="libx264", pixelformat="yuv420p")
+                imageio.mimwrite(str(path2), frames2, fps=fps, codec="libx264", pixelformat="yuv420p")
+
+                # 保存遥测数据
+                with open(path_tele, "w") as f:
+                    for entry in tele_log:
+                        f.write(json.dumps(entry) + "\n")
+
+                logger.info(f"Session saved to {session_dir}")
+            except Exception as e:
+                logger.error(f"Failed to save session: {e}")
+
+        threading.Thread(target=_save, daemon=True).start()
 
     @property
     def state(self) -> State:
@@ -163,13 +195,24 @@ class Coordinator:
     # ------------------------------------------------------------------
 
     def run_control_loop(self):
+        """10Hz 控制循环。"""
         dt = 1.0 / self._args.control_hz
         self._env.start()
         self._env.start_skill_thread()
         logger.info("Control loop started (skill thread running at 10Hz)")
 
+        last_state = State.IDLE
         while True:
             t_start = time.time()
+            with self._state_lock:
+                current_state = self._state
+
+            # 自动录制逻辑：进入 RUNNING 开始，退出 RUNNING 停止
+            if current_state == State.RUNNING and last_state != State.RUNNING:
+                self._start_session_logging()
+            elif current_state != State.RUNNING and last_state == State.RUNNING:
+                self._stop_session_logging()
+            last_state = current_state
 
             try:
                 self._step()
@@ -200,11 +243,14 @@ class Coordinator:
         # 缓存最新 state
         with self._telemetry_lock:
             self._latest_state = obs["observation/state"].tolist()
+            self._latest_joints = obs.get("observation/joints", np.zeros(7)).tolist()
+            self._latest_target_pose = self._env.commanded_pose_array.tolist()
 
         # 录屏：分别保存双路图像帧
-        if self._recording and img1_raw is not None and img2_raw is not None:
-            self._record_frames1.append(img1_raw.copy())
-            self._record_frames2.append(img2_raw.copy())
+        with self._record_lock:
+            if self._recording and img1_raw is not None and img2_raw is not None:
+                self._record_frames1.append(img1_raw.copy())
+                self._record_frames2.append(img2_raw.copy())
 
         if current_state == State.RUNNING:
             # action_plan 耗尽时推理
@@ -227,10 +273,37 @@ class Coordinator:
 
             action = self._action_plan.popleft()  # (7,)
             self._env.enqueue_action(action)
+
+            # 使用统一的变换逻辑
+            ta = transform_action(action)
+
             with self._telemetry_lock:
                 self._latest_action = action.tolist()
+                self._latest_action_transformed = ta.tolist()
+
+            # 遥测日志记录
+            now = time.time()
+            if now - self._last_tele_log_time >= 1.0 / self._args.telemetry_hz:
+                entry = {
+                        "timestamp": now,
+                        "state": self._state.value,
+                        "latest_state": self._latest_state,
+                        "latest_joints": self._latest_joints,
+                        "latest_target_pose": self._latest_target_pose,
+                        "latest_action": self._latest_action,
+                        "latest_action_transformed": self._latest_action_transformed,
+                        "infer_ms": self._latest_infer_ms,
+                        "prev_total_ms": self._latest_prev_total_ms,
+                    }
+                with self._record_lock:
+                    self._telemetry_log.append(entry)
+                    # 限制 telemetry_log 大小以防止内存泄漏 (保留最近 1 小时的数据 @ 3Hz ≈ 10800 条)
+                    if len(self._telemetry_log) > 10800:
+                        self._telemetry_log.pop(0)
+                self._last_tele_log_time = now
 
         elif current_state == State.HOMING:
+            self._env._stop_skill_thread()
             self._env.reset_to_home()
             self._env.start_skill_thread()
             with self._state_lock:
@@ -259,8 +332,20 @@ class Coordinator:
             img1_b64 = _encode_jpeg_b64(img1)
             img2_b64 = _encode_jpeg_b64(img2)
 
-            payload = {"img1": img1_b64, "img2": img2_b64}
-            import json
+            payload = {
+                "state": self._state.value,
+                "img1": img1_b64,
+                "img2": img2_b64,
+                "latest_state": self._latest_state,
+                "latest_joints": self._latest_joints,
+                "latest_target_pose": self._latest_target_pose,
+                "latest_action": self._latest_action,
+                "latest_action_transformed": self._latest_action_transformed,
+                "infer_ms": self._latest_infer_ms,
+                "prev_total_ms": self._latest_prev_total_ms,
+                "robot_connected": not self._args.no_robot,
+                "server_connected": self._client is not None
+            }
             msg = json.dumps(payload)
 
             async with self._ws_lock:
@@ -291,8 +376,13 @@ def build_app(coordinator: Coordinator) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
-        with open(pathlib.Path(STATIC_DIR) / "index.html") as f:
-            return f.read()
+        static_file = pathlib.Path(STATIC_DIR) / "index.html"
+        with open(static_file, "r") as f:
+            content = f.read()
+        # 注入超参数给前端
+        tele_interval = int(1000 / coordinator._args.telemetry_hz)
+        content = content.replace("{{telemetry_interval}}", str(tele_interval))
+        return HTMLResponse(content=content)
 
     @app.post("/cmd/start")
     async def cmd_start():
@@ -313,16 +403,6 @@ def build_app(coordinator: Coordinator) -> FastAPI:
     async def cmd_prompt(body: dict):
         coordinator.cmd_set_prompt(body.get("prompt", ""))
         return {"ok": True}
-
-    @app.post("/cmd/record/start")
-    async def cmd_record_start():
-        coordinator.cmd_start_record()
-        return {"recording": True}
-
-    @app.post("/cmd/record/stop")
-    async def cmd_record_stop():
-        saved = coordinator.cmd_stop_record()
-        return {"recording": False, "saved_to": saved}
 
     @app.get("/status")
     async def status():

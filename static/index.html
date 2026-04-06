@@ -7,7 +7,7 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #1a1a1a; color: #eee; font-family: monospace; padding: 16px; }
   h1 { font-size: 1.2rem; margin-bottom: 12px; color: #adf; }
-  .cameras { display: flex; gap: 12px; margin-bottom: 12px; }
+  .cameras { display: flex; gap: 12px; margin-bottom: 12px; width: 80%; }
   .cam-box { flex: 1; }
   .cam-box label { font-size: 0.75rem; color: #888; display: block; margin-bottom: 4px; }
   .cam-box img { width: 100%; border: 1px solid #444; background: #000; display: block; }
@@ -19,8 +19,6 @@
   #btn-start  { background: #2a7a2a; color: #fff; }
   #btn-stop   { background: #7a2a2a; color: #fff; }
   #btn-home   { background: #2a4a7a; color: #fff; }
-  #btn-record { background: #7a6a2a; color: #fff; }
-  #btn-stop-record { background: #555; color: #fff; }
   button:disabled { opacity: 0.4; cursor: default; }
   .prompt-row { display: flex; gap: 8px; margin-bottom: 12px; }
   #prompt-input {
@@ -90,8 +88,6 @@
   <button id="btn-start"       onclick="cmd('start')">推理</button>
   <button id="btn-stop"        onclick="cmd('stop')">停止</button>
   <button id="btn-home"        onclick="cmd('home')">复位</button>
-  <button id="btn-record"      onclick="startRecord()">录屏</button>
-  <button id="btn-stop-record" onclick="stopRecord()" disabled>停止录屏</button>
 </div>
 
 <div class="status-bar">
@@ -104,15 +100,51 @@
 <div class="telemetry">
   <div class="tele-box" id="tele-state-box" style="display:none">
     <label>State（机械臂）</label>
-    <div class="tele-row"><span class="tele-key">pos xyz</span><span class="tele-val" id="tele-pos">—</span></div>
-    <div class="tele-row"><span class="tele-key">rot axisangle</span><span class="tele-val" id="tele-rot">—</span></div>
-    <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-grip">—</span></div>
+    <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-pos-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-pos-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-pos-z">—</span></div>
+    <div class="tele-row"><span class="tele-key">rot ax</span><span class="tele-val" id="tele-rot-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">rot ay</span><span class="tele-val" id="tele-rot-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">rot az</span><span class="tele-val" id="tele-rot-z">—</span></div>
+    <div class="tele-row"><span class="tele-key">finger1</span><span class="tele-val" id="tele-grip1">—</span></div>
+    <div class="tele-row"><span class="tele-key">finger2</span><span class="tele-val" id="tele-grip2">—</span></div>
+  </div>
+  <div class="tele-box" id="tele-joint-box" style="display:none">
+    <label>Joints（关节角度）</label>
+    <div class="tele-row"><span class="tele-key">q1</span><span class="tele-val" id="tele-q1">—</span></div>
+    <div class="tele-row"><span class="tele-key">q2</span><span class="tele-val" id="tele-q2">—</span></div>
+    <div class="tele-row"><span class="tele-key">q3</span><span class="tele-val" id="tele-q3">—</span></div>
+    <div class="tele-row"><span class="tele-key">q4</span><span class="tele-val" id="tele-q4">—</span></div>
+    <div class="tele-row"><span class="tele-key">q5</span><span class="tele-val" id="tele-q5">—</span></div>
+    <div class="tele-row"><span class="tele-key">q6</span><span class="tele-val" id="tele-q6">—</span></div>
+    <div class="tele-row"><span class="tele-key">q7</span><span class="tele-val" id="tele-q7">—</span></div>
+  </div>
+  <div class="tele-box" id="tele-target-box" style="display:none">
+    <label>Target Pose（指令目标）</label>
+    <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-tpos-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-tpos-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-tpos-z">—</span></div>
+    <div class="tele-row"><span class="tele-key">rot ax</span><span class="tele-val" id="tele-trot-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">rot ay</span><span class="tele-val" id="tele-trot-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">rot az</span><span class="tele-val" id="tele-trot-z">—</span></div>
   </div>
   <div class="tele-box" id="tele-action-box" style="display:none">
-    <label>Action（上一步）</label>
-    <div class="tele-row"><span class="tele-key">Δpos xyz</span><span class="tele-val" id="tele-apos">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δrot axisangle</span><span class="tele-val" id="tele-arot">—</span></div>
+    <label>Action（原始输出）</label>
+    <div class="tele-row"><span class="tele-key">Δpos x</span><span class="tele-val" id="tele-apos-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δpos y</span><span class="tele-val" id="tele-apos-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δpos z</span><span class="tele-val" id="tele-apos-z">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δrot ax</span><span class="tele-val" id="tele-arot-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δrot ay</span><span class="tele-val" id="tele-arot-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δrot az</span><span class="tele-val" id="tele-arot-z">—</span></div>
     <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-agrip">—</span></div>
+    <label style="margin-top:6px">Action（变换后）</label>
+    <div class="tele-row"><span class="tele-key">Δpos x</span><span class="tele-val" id="tele-tapos-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δpos y</span><span class="tele-val" id="tele-tapos-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δpos z</span><span class="tele-val" id="tele-tapos-z">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δrot ax</span><span class="tele-val" id="tele-tarot-x">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δrot ay</span><span class="tele-val" id="tele-tarot-y">—</span></div>
+    <div class="tele-row"><span class="tele-key">Δrot az</span><span class="tele-val" id="tele-tarot-z">—</span></div>
+    <div class="tele-row"><span class="tele-key">gripper target</span><span class="tele-val" id="tele-tagrip">—</span></div>
     <div class="tele-row"><span class="tele-key">推理耗时</span><span class="tele-val" id="tele-infer-ms">—</span></div>
     <div class="tele-row"><span class="tele-key">总耗时</span><span class="tele-val" id="tele-total-ms">—</span></div>
   </div>
@@ -128,10 +160,25 @@ const dotServer = document.getElementById('dot-server');
 
 // --- WebSocket 图像流 ---
 const ws = new WebSocket(`ws://${location.host}/ws/frames`);
+let lastTeleUpdate = 0;
+const TELE_UPDATE_INTERVAL = {{telemetry_interval}}; // 由后端注入
+
 ws.onmessage = (e) => {
   const data = JSON.parse(e.data);
   img1.src = 'data:image/jpeg;base64,' + data.img1;
   img2.src = 'data:image/jpeg;base64,' + data.img2;
+
+  // 状态量 (State/Connection) 实时更新 (20Hz)
+  if (data.state) updateBadge(data.state);
+  dotRobot.classList.toggle('on', !!data.robot_connected);
+  dotServer.classList.toggle('on', !!data.server_connected);
+
+  // 数值量 (Telemetry) 节流更新 (约 3Hz)，让肉眼能看清
+  const now = Date.now();
+  if (now - lastTeleUpdate > TELE_UPDATE_INTERVAL) {
+    updateTelemetry(data);
+    lastTeleUpdate = now;
+  }
 };
 ws.onclose = () => console.warn('WS closed');
 
@@ -150,30 +197,126 @@ async function sendPrompt() {
   });
 }
 
-async function startRecord() {
-  await fetch('/cmd/record/start', { method: 'POST' });
-  document.getElementById('btn-record').disabled = true;
-  document.getElementById('btn-stop-record').disabled = false;
-  recIndicator.classList.add('active');
-}
-
-async function stopRecord() {
-  const res = await fetch('/cmd/record/stop', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({}),
-  });
-  const data = await res.json();
-  alert(`录屏已保存：\ncam1: ${data.saved_to?.cam1}\ncam2: ${data.saved_to?.cam2}`);
-  document.getElementById('btn-record').disabled = false;
-  document.getElementById('btn-stop-record').disabled = true;
-  recIndicator.classList.remove('active');
-}
-
 // --- 状态轮询 ---
 function updateBadge(state) {
   stateBadge.textContent = state;
   stateBadge.className = `state-${state}`;
+}
+
+// --- 元素缓存 ---
+const teleEls = {
+  posX: document.getElementById('tele-pos-x'),
+  posY: document.getElementById('tele-pos-y'),
+  posZ: document.getElementById('tele-pos-z'),
+  rotX: document.getElementById('tele-rot-x'),
+  rotY: document.getElementById('tele-rot-y'),
+  rotZ: document.getElementById('tele-rot-z'),
+  grip1: document.getElementById('tele-grip1'),
+  grip2: document.getElementById('tele-grip2'),
+  q1: document.getElementById('tele-q1'),
+  q2: document.getElementById('tele-q2'),
+  q3: document.getElementById('tele-q3'),
+  q4: document.getElementById('tele-q4'),
+  q5: document.getElementById('tele-q5'),
+  q6: document.getElementById('tele-q6'),
+  q7: document.getElementById('tele-q7'),
+  aposX: document.getElementById('tele-apos-x'),
+  aposY: document.getElementById('tele-apos-y'),
+  aposZ: document.getElementById('tele-apos-z'),
+  arotX: document.getElementById('tele-arot-x'),
+  arotY: document.getElementById('tele-arot-y'),
+  arotZ: document.getElementById('tele-arot-z'),
+  agrip: document.getElementById('tele-agrip'),
+  taposX: document.getElementById('tele-tapos-x'),
+  taposY: document.getElementById('tele-tapos-y'),
+  taposZ: document.getElementById('tele-tapos-z'),
+  tarotX: document.getElementById('tele-tarot-x'),
+  tarotY: document.getElementById('tele-tarot-y'),
+  tarotZ: document.getElementById('tele-tarot-z'),
+  tagrip: document.getElementById('tele-tagrip'),
+  tposX: document.getElementById('tele-tpos-x'),
+  tposY: document.getElementById('tele-tpos-y'),
+  tposZ: document.getElementById('tele-tpos-z'),
+  trotX: document.getElementById('tele-trot-x'),
+  trotY: document.getElementById('tele-trot-y'),
+  trotZ: document.getElementById('tele-trot-z'),
+  inferMs: document.getElementById('tele-infer-ms'),
+  totalMs: document.getElementById('tele-total-ms'),
+  stateBox: document.getElementById('tele-state-box'),
+  jointBox: document.getElementById('tele-joint-box'),
+  targetBox: document.getElementById('tele-target-box'),
+  actionBox: document.getElementById('tele-action-box')
+};
+
+function updateTelemetry(data) {
+  const fmt = (v) => v.toFixed(4);
+  const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
+
+  teleEls.stateBox.style.display = data.robot_connected ? '' : 'none';
+  teleEls.jointBox.style.display = data.robot_connected ? '' : 'none';
+  if (teleEls.targetBox) teleEls.targetBox.style.display = (data.robot_connected && data.state === 'running') ? '' : 'none';
+  teleEls.actionBox.style.display = data.server_connected ? '' : 'none';
+
+  if (data.robot_connected && data.latest_state) {
+    const s = data.latest_state;
+    set(teleEls.posX, fmt(s[0]));
+    set(teleEls.posY, fmt(s[1]));
+    set(teleEls.posZ, fmt(s[2]));
+    set(teleEls.rotX, fmt(s[3]));
+    set(teleEls.rotY, fmt(s[4]));
+    set(teleEls.rotZ, fmt(s[5]));
+    set(teleEls.grip1, fmt(s[6]));
+    set(teleEls.grip2, fmt(s[7]));
+  }
+  if (data.robot_connected && data.latest_joints) {
+    const q = data.latest_joints;
+    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
+    set(teleEls.q1, fmt(q[0]));
+    set(teleEls.q2, fmt(q[1]));
+    set(teleEls.q3, fmt(q[2]));
+    set(teleEls.q4, fmt(q[3]));
+    set(teleEls.q5, fmt(q[4]));
+    set(teleEls.q6, fmt(q[5]));
+    set(teleEls.q7, fmt(q[6]));
+  }
+  if (data.robot_connected && data.latest_target_pose) {
+    const tp = data.latest_target_pose;
+    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
+    set(teleEls.tposX, fmt(tp[0]));
+    set(teleEls.tposY, fmt(tp[1]));
+    set(teleEls.tposZ, fmt(tp[2]));
+    set(teleEls.trotX, fmt(tp[3]));
+    set(teleEls.trotY, fmt(tp[4]));
+    set(teleEls.trotZ, fmt(tp[5]));
+  }
+  if (data.server_connected && data.latest_action) {
+    const a = data.latest_action;
+    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
+    set(teleEls.aposX, fmt(a[0]));
+    set(teleEls.aposY, fmt(a[1]));
+    set(teleEls.aposZ, fmt(a[2]));
+    set(teleEls.arotX, fmt(a[3]));
+    set(teleEls.arotY, fmt(a[4]));
+    set(teleEls.arotZ, fmt(a[5]));
+    set(teleEls.agrip, fmt(a[6]));
+  }
+  if (data.server_connected && data.latest_action_transformed) {
+    const ta = data.latest_action_transformed;
+    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
+    set(teleEls.taposX, fmt(ta[0]));
+    set(teleEls.taposY, fmt(ta[1]));
+    set(teleEls.taposZ, fmt(ta[2]));
+    set(teleEls.tarotX, fmt(ta[3]));
+    set(teleEls.tarotY, fmt(ta[4]));
+    set(teleEls.tarotZ, fmt(ta[5]));
+    set(teleEls.tagrip, (ta[6] > 0.04 ? 'OPEN' : 'CLOSE'));
+  }
+  if (data.infer_ms != null) {
+    teleEls.inferMs.textContent = data.infer_ms.toFixed(1) + ' ms';
+  }
+  if (data.prev_total_ms != null) {
+    teleEls.totalMs.textContent = data.prev_total_ms.toFixed(1) + ' ms';
+  }
 }
 
 async function pollStatus() {
@@ -188,31 +331,9 @@ async function pollStatus() {
   dotRobot.classList.toggle('on', !!data.robot_connected);
   dotServer.classList.toggle('on', !!data.server_connected);
 
-  const stateBox = document.getElementById('tele-state-box');
-  const actionBox = document.getElementById('tele-action-box');
-  stateBox.style.display = data.robot_connected ? '' : 'none';
-  actionBox.style.display = data.server_connected ? '' : 'none';
-
-  const fmt = (v) => v.toFixed(4);
-  const fmtArr = (arr) => arr.map(fmt).join('  ');
-
-  if (data.robot_connected && data.latest_state) {
-    const s = data.latest_state;
-    document.getElementById('tele-pos').textContent  = fmtArr(s.slice(0,3));
-    document.getElementById('tele-rot').textContent  = fmtArr(s.slice(3,6));
-    document.getElementById('tele-grip').textContent = fmt(s[6]);
-  }
-  if (data.server_connected && data.latest_action) {
-    const a = data.latest_action;
-    document.getElementById('tele-apos').textContent  = fmtArr(a.slice(0,3));
-    document.getElementById('tele-arot').textContent  = fmtArr(a.slice(3,6));
-    document.getElementById('tele-agrip').textContent = fmt(a[6]);
-  }
-  if (data.infer_ms != null) {
-    document.getElementById('tele-infer-ms').textContent = data.infer_ms.toFixed(1) + ' ms';
-  }
-  if (data.prev_total_ms != null) {
-    document.getElementById('tele-total-ms').textContent = data.prev_total_ms.toFixed(1) + ' ms';
+  // 如果 WS 没开，则由轮询驱动数据更新
+  if (ws.readyState !== WebSocket.OPEN) {
+    updateTelemetry(data);
   }
 }
 
