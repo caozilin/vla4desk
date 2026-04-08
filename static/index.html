@@ -80,7 +80,7 @@
 </div>
 
 <div class="prompt-row">
-  <input id="prompt-input" type="text" placeholder="输入语言指令..." value="pick up the object">
+  <input id="prompt-input" type="text" placeholder="输入语言指令..." value="pick up the bottle and put it into the box">
   <button id="btn-send-prompt" onclick="sendPrompt()">发送指令</button>
 </div>
 
@@ -161,7 +161,7 @@ const dotServer = document.getElementById('dot-server');
 // --- WebSocket 图像流 ---
 const ws = new WebSocket(`ws://${location.host}/ws/frames`);
 let lastTeleUpdate = 0;
-const TELE_UPDATE_INTERVAL = {{telemetry_interval}}; // 由后端注入
+const TELE_UPDATE_INTERVAL = 100; // 遥测数据更新节流间隔（ms）
 
 ws.onmessage = (e) => {
   const data = JSON.parse(e.data);
@@ -173,7 +173,7 @@ ws.onmessage = (e) => {
   dotRobot.classList.toggle('on', !!data.robot_connected);
   dotServer.classList.toggle('on', !!data.server_connected);
 
-  // 数值量 (Telemetry) 节流更新 (约 3Hz)，让肉眼能看清
+  // 数值量 (Telemetry) 节流更新，让肉眼能看清
   const now = Date.now();
   if (now - lastTeleUpdate > TELE_UPDATE_INTERVAL) {
     updateTelemetry(data);

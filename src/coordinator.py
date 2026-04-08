@@ -50,13 +50,12 @@ class Args:
     host: str = "100.96.2.67"    # 云端推理服务 IP（openpi，Tailscale）
     port: int = 8000             # 云端推理服务端口
     web_port: int = 8080         # 本地 Web 前端端口
-    cam1_serial: str | None = None   # 外部相机 serial（占位）
-    cam2_serial: str | None = None   # 腕部相机 serial（占位）
+    cam1_serial: str | None = "346222072769"   # 外部相机 serial（主视角）
+    cam2_serial: str | None = "938422075745"   # 腕部相机 serial
     api_key: str | None = None   # 推理服务 API key（若有）
     replan_steps: int = 5        # 每次推理取几步 action 执行
     no_robot: bool = False       # 不启动 FrankaArm（机械臂未连接时使用）
     control_hz: float = 10.0     # 控制循环频率（Hz），与 skill loop 对齐
-    telemetry_hz: float = 3.0    # 遥测记录与展示频率 (Hz)
 
 
 class Coordinator:
@@ -74,9 +73,9 @@ class Coordinator:
         self._recording = False
         self._record_frames1: list[np.ndarray] = []
         self._record_frames2: list[np.ndarray] = []
-        self._telemetry_log: list[dict] = []
+        self._telemetry_log: collections.deque = collections.deque(maxlen=10800)
         self._session_dir: pathlib.Path | None = None
-        self._last_tele_log_time = 0.0
+        self._record_start_time: float = 0.0
         self._record_lock = threading.Lock()
 
         # 最新帧（供 WebSocket 推流）
@@ -146,7 +145,7 @@ class Coordinator:
             self._session_dir = LOGS_BASE_DIR / time.strftime("%Y%m%d_%H%M%S")
             self._session_dir.mkdir(parents=True, exist_ok=True)
             self._recording = True
-            self._last_tele_log_time = 0.0
+            self._record_start_time = time.time()  # 记录开始时间，用于计算相对时间戳
         logger.info(f"Auto-recording started: {self._session_dir}")
 
     def _stop_session_logging(self):
@@ -154,7 +153,7 @@ class Coordinator:
             self._recording = False
             frames1 = self._record_frames1[:]
             frames2 = self._record_frames2[:]
-            tele_log = self._telemetry_log[:]
+            tele_log = list(self._telemetry_log)
             self._record_frames1.clear()
             self._record_frames2.clear()
             self._telemetry_log.clear()
@@ -163,27 +162,22 @@ class Coordinator:
         if not frames1 or session_dir is None:
             return
 
-        def _save():
-            try:
-                path1 = session_dir / "cam1.mp4"
-                path2 = session_dir / "cam2.mp4"
-                path_tele = session_dir / "telemetry.jsonl"
+        try:
+            path1 = session_dir / "cam1.mp4"
+            path2 = session_dir / "cam2.mp4"
+            path_tele = session_dir / "telemetry.jsonl"
 
-                # 保存视频 (与 control_hz 对齐)
-                fps = self._args.control_hz
-                imageio.mimwrite(str(path1), frames1, fps=fps, codec="libx264", pixelformat="yuv420p")
-                imageio.mimwrite(str(path2), frames2, fps=fps, codec="libx264", pixelformat="yuv420p")
+            fps = self._args.control_hz
+            imageio.mimwrite(str(path1), frames1, fps=fps, codec="libx264", pixelformat="yuv420p")
+            imageio.mimwrite(str(path2), frames2, fps=fps, codec="libx264", pixelformat="yuv420p")
 
-                # 保存遥测数据
-                with open(path_tele, "w") as f:
-                    for entry in tele_log:
-                        f.write(json.dumps(entry) + "\n")
+            with open(path_tele, "w") as f:
+                for entry in tele_log:
+                    f.write(json.dumps(entry, indent=2) + "\n")
 
-                logger.info(f"Session saved to {session_dir}")
-            except Exception as e:
-                logger.error(f"Failed to save session: {e}")
-
-        threading.Thread(target=_save, daemon=True).start()
+            logger.info(f"Session saved to {session_dir}")
+        except Exception as e:
+            logger.error(f"Failed to save session: {e}")
 
     @property
     def state(self) -> State:
@@ -245,6 +239,7 @@ class Coordinator:
             self._latest_state = obs["observation/state"].tolist()
             self._latest_joints = obs.get("observation/joints", np.zeros(7)).tolist()
             self._latest_target_pose = self._env.commanded_pose_array.tolist()
+            self._latest_ee_force_torque = self._env.ee_force_torque.tolist()
 
         # 录屏：分别保存双路图像帧
         with self._record_lock:
@@ -281,26 +276,24 @@ class Coordinator:
                 self._latest_action = action.tolist()
                 self._latest_action_transformed = ta.tolist()
 
-            # 遥测日志记录
-            now = time.time()
-            if now - self._last_tele_log_time >= 1.0 / self._args.telemetry_hz:
-                entry = {
-                        "timestamp": now,
+            # 每次执行动作步都记录遥测日志，时间戳为相对于视频开始的时间
+            with self._record_lock:
+                if self._recording:
+                    # 计算相对于录制开始的时间戳（从0开始）
+                    relative_time = time.time() - self._record_start_time
+                    entry = {
+                        "timestamp": round(relative_time, 3),
                         "state": self._state.value,
-                        "latest_state": self._latest_state,
-                        "latest_joints": self._latest_joints,
-                        "latest_target_pose": self._latest_target_pose,
-                        "latest_action": self._latest_action,
-                        "latest_action_transformed": self._latest_action_transformed,
-                        "infer_ms": self._latest_infer_ms,
-                        "prev_total_ms": self._latest_prev_total_ms,
+                        "observation_state": self._latest_state,
+                        "observation_joints": self._latest_joints,
+                        "commanded_target_pose": self._latest_target_pose,
+                        "ee_force_torque": self._latest_ee_force_torque,
+                        "action_raw": self._latest_action,
+                        "action_transformed": self._latest_action_transformed,
+                        "inference_time_ms": self._latest_infer_ms,
+                        "total_time_ms": self._latest_prev_total_ms,
                     }
-                with self._record_lock:
                     self._telemetry_log.append(entry)
-                    # 限制 telemetry_log 大小以防止内存泄漏 (保留最近 1 小时的数据 @ 3Hz ≈ 10800 条)
-                    if len(self._telemetry_log) > 10800:
-                        self._telemetry_log.pop(0)
-                self._last_tele_log_time = now
 
         elif current_state == State.HOMING:
             self._env._stop_skill_thread()
@@ -379,9 +372,6 @@ def build_app(coordinator: Coordinator) -> FastAPI:
         static_file = pathlib.Path(STATIC_DIR) / "index.html"
         with open(static_file, "r") as f:
             content = f.read()
-        # 注入超参数给前端
-        tele_interval = int(1000 / coordinator._args.telemetry_hz)
-        content = content.replace("{{telemetry_interval}}", str(tele_interval))
         return HTMLResponse(content=content)
 
     @app.post("/cmd/start")

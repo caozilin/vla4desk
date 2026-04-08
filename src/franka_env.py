@@ -44,10 +44,21 @@ except ImportError:
 
 from scipy.spatial.transform import Rotation
 
-POS_CLIP = 0.05
-ROT_CLIP = 0.5
-POS_SCALE = 1.0
-ROT_SCALE = 1.0
+CONTROL_DT = 0.1   # 每个 action 的执行周期（s），决定控制频率
+INTERP_DT = 0.02   # 50Hz：每次 sensor message 间隔（与示例一致）
+INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
+
+POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
+ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
+POS_MAX_VEL = 0.1  /3     # 末端位置最大速度 (m/s)
+ROT_MAX_VEL = math.pi / 2 /3   # 末端旋转最大速度 (rad/s)
+GRIPPER_SPEED = 0.08    # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
+POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
+ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
+
+# 阻抗控制刚度参数
+TRANSLATIONAL_STIFFNESS = [600.0, 600.0, 600.0]  # 平移刚度 [x, y, z] (N/m)，原始值 [600, 600, 600]
+ROTATIONAL_STIFFNESS = [50.0, 50.0, 50.0]        # 旋转刚度 [ax, ay, az] (Nm/rad)，原始值 [50, 50, 50]
 
 
 def transform_action(action: np.ndarray) -> np.ndarray:
@@ -131,31 +142,89 @@ class DualD435:
 RESIZE = 224
 
 
-def quat2axisangle(quat: np.ndarray) -> np.ndarray:
-    """quaternion [x,y,z,w] → axis-angle (3,)，与 libero 保持一致。"""
-    if quat[3] > 1.0:
-        quat[3] = 1.0
-    elif quat[3] < -1.0:
-        quat[3] = -1.0
-    den = np.sqrt(1.0 - quat[3] ** 2)
-    if math.isclose(den, 0.0):
-        return np.zeros(3)
-    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+def normalize_rotvec(rotvec: np.ndarray) -> np.ndarray:
+    """规范化旋转矢量到 [-π, π] 范围，并处理奇异性保持连续性。
+    
+    旋转矢量表示的奇异性问题：
+    - 当旋转角度接近 ±π 时，旋转方向可能发生突变
+    - 当旋转角度为 0 或 2π 时，表示不唯一
+    
+    处理方法：
+    1. 将角度规范化到 [-π, π] 范围
+    2. 检测并修复角度跳变（unwrap），保持旋转连续性
+    """
+    rotvec = np.asarray(rotvec, dtype=np.float64).copy()
+    
+    # 计算旋转角度（标量）
+    angle = np.linalg.norm(rotvec)
+    
+    if angle < 1e-6:
+        # 角度接近0，返回零向量
+        return rotvec
+    
+    # 轴向
+    axis = rotvec / angle
+    
+    # 规范化角度到 [-π, π]
+    angle = np.angle(np.exp(1j * angle))  # 等价于 angle % (2*π) 然后移到 [-π, π]
+    
+    # 检查是否需要 unwrap：若与上一次角度差异超过 π，则调整
+    # 这里假设单帧内不会有超过 π 的旋转，因此若出现大跳变则取相反方向
+    if angle > np.pi - 0.1:  # 接近 +π 时，检测是否应取 -π 方向
+        # 检查是否从负值跳变过来，若是从正方向接近 π，可能取反更连续
+        pass  # 具体情况由调用者传入历史状态判断
+    
+    return axis * angle
 
 
-CONTROL_DT = 0.1   # 每个 action 的执行周期（s），决定控制频率
-INTERP_DT = 0.02   # 50Hz：每次 sensor message 间隔（与示例一致）
-INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
-
-# Action 缩放超参数
-POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
-ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
-POS_MAX_VEL = 0.1       # 末端位置最大速度 (m/s)
-ROT_MAX_VEL = math.pi   # 末端旋转最大速度 (rad/s)
-GRIPPER_SPEED = 0.08    # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
-# 由超参数推导的每步缩放系数（当 action=clip 上限时，delta = MAX_VEL × CONTROL_DT）
-POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
-ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
+def normalize_rotvec_with_history(rotvec: np.ndarray, prev_rotvec: np.ndarray | None) -> np.ndarray:
+    """带历史信息的旋转矢量规范化，处理奇异性保持连续性。
+    
+    Args:
+        rotvec: 当前旋转矢量
+        prev_rotvec: 上一帧的旋转矢量，若为 None 则使用单帧规范化
+    """
+    rotvec = np.asarray(rotvec, dtype=np.float64).copy()
+    
+    if prev_rotvec is None:
+        return normalize_rotvec(rotvec)
+    
+    # 计算当前角度和轴向
+    current_angle = np.linalg.norm(rotvec)
+    if current_angle < 1e-6:
+        return rotvec
+    
+    current_axis = rotvec / current_angle
+    current_angle = np.angle(np.exp(1j * current_angle))
+    
+    # 计算上一帧角度
+    prev_angle = np.linalg.norm(prev_rotvec)
+    if prev_angle < 1e-6:
+        prev_angle = 0.0
+        prev_axis = np.array([0., 0., 1.])
+    else:
+        prev_axis = prev_rotvec / prev_angle
+        prev_angle = np.angle(np.exp(1j * prev_angle))
+    
+    # 检测轴向是否反转（检测 θ -> -θ + 2π 的跳变）
+    angle_diff = current_angle - prev_angle
+    
+    # 若角度差超过 π，说明发生了奇异性跳变
+    if abs(angle_diff) > np.pi:
+        # 调整当前角度以保持连续
+        if angle_diff > 0:
+            current_angle -= 2 * np.pi
+        else:
+            current_angle += 2 * np.pi
+    
+    # 检测轴向是否反转（当角度很小时可能需要）
+    if abs(current_angle) < 0.1:  # 角度很小时，检查是否应取相反轴
+        axis_dot = np.dot(current_axis, prev_axis)
+        if axis_dot < -0.9:  # 轴向几乎相反
+            # 保持上一帧的轴向反转
+            return -prev_rotvec
+    
+    return current_axis * current_angle
 
 
 class FrankaEnv:
@@ -184,6 +253,17 @@ class FrankaEnv:
         self._skill_stop = threading.Event()
         self._lock = threading.Lock()
         self._commanded_pose_array = np.zeros(6)
+        
+        # 实际位姿缓存：_skill_loop 定期更新，get_observation 读取，避免重复调用 ROS API
+        self._cached_pose: np.ndarray | None = None  # [pos(3), rot_axisangle(3)]
+        self._cached_joints: np.ndarray | None = None  # (7,)
+        self._cached_gripper_width: float | None = None  # 单指开口(m)
+        
+        # 末端力矩缓存：[force(3), torque(3)]，单位 [N, Nm]
+        self._cached_ee_force_torque: np.ndarray | None = None  # (6,)
+        
+        # 旋转矢量历史缓存（用于处理奇异性）
+        self._prev_rotvec: np.ndarray | None = None  # 上一帧的轴角
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -219,17 +299,33 @@ class FrankaEnv:
         )
 
         if self._fa is not None:
-            pose = self._fa.get_pose()  # RigidTransform
-            joints = self._fa.get_joints()  # (7,) 关节角度
-            half = self._fa.get_gripper_width() / 2.0  # 单指开口(m)
+            # 从缓存读取，避免重复调用 ROS API（_skill_loop 会定期更新缓存）
+            with self._lock:
+                if self._cached_pose is None or self._cached_joints is None or self._cached_gripper_width is None:
+                    # 首次调用，需要从 ROS 读取
+                    pose_rt = self._fa.get_pose()
+                    joints = self._fa.get_joints()
+                    half = self._fa.get_gripper_width() / 2.0
+                    # 直接用 pose_rt 构建 state（轴角）
+                    from scipy.spatial.transform import Rotation
+                    pos = pose_rt.translation
+                    rot = Rotation.from_matrix(pose_rt.rotation).as_rotvec()
+                else:
+                    # 使用缓存
+                    pos = self._cached_pose[:3]
+                    rot = self._cached_pose[3:6]
+                    joints = self._cached_joints
+                    half = self._cached_gripper_width
+            
             state = np.concatenate([
-                pose.translation,                    # (3,) eef pos
-                quat2axisangle(pose.quaternion),     # (3,) eef rot
-                [+half],                             # (1,) finger1 qpos，对应 libero robot0_gripper_qpos[0]
-                [-half],                             # (1,) finger2 qpos，对应 libero robot0_gripper_qpos[1]
+                pos,                             # (3,) eef pos (基座坐标系)
+                rot,                             # (3,) eef rot (axisangle, 基座坐标系)
+                [+half],                         # (1,) finger1 qpos
+                [-half],                         # (1,) finger2 qpos
             ])
         else:
             state = np.zeros(8, dtype=np.float64)
+            joints = np.zeros(7, dtype=np.float64)
 
         return {
             "observation/image": img1_resized,
@@ -249,6 +345,8 @@ class FrankaEnv:
             if self._skill_thread is not None and self._skill_thread.is_alive():
                 return
             self._skill_stop.clear()
+            # 重置历史旋转矢量，避免从旧的缓存开始导致奇异性处理错误
+            self._prev_rotvec = None
             self._skill_thread = threading.Thread(
                 target=self._skill_loop, daemon=True
             )
@@ -274,6 +372,9 @@ class FrankaEnv:
             return
 
         fa = self._fa
+        # 【只会在这里执行一次】
+        logger.info("等待机械臂状态同步...")
+        time.sleep(1.0)
         current_pose = fa.get_pose()
 
         logger.info("启动 dynamic skill...")
@@ -287,11 +388,30 @@ class FrankaEnv:
         msg_id = 0
         # 维护指令位姿（commanded pose），在其基础上叠加 delta，而非实际位姿
         commanded_pose = current_pose.copy()
+        # 立即更新 commanded_pose_array，避免外部读取到初始的零值
+        rot_vec = normalize_rotvec(Rotation.from_matrix(commanded_pose.rotation).as_rotvec())
+        self._commanded_pose_array = np.concatenate([commanded_pose.translation, rot_vec])
         logger.info("dynamic skill 就绪，开始接收 action")
 
         last_gripper: float | None = None
 
         while not self._skill_stop.is_set():
+            # 每个控制周期读取一次实际位姿和末端力矩，更新缓存供 get_observation 使用
+            with self._lock:
+                actual_pose = fa.get_pose()
+                actual_joints = fa.get_joints()
+                actual_gripper_half = fa.get_gripper_width() / 2.0
+                ee_force_torque = fa.get_ee_force_torque()
+                # 更新缓存（使用历史信息规范化旋转矢量，处理奇异性）
+                raw_rot_vec = Rotation.from_matrix(actual_pose.rotation).as_rotvec()
+                rot_vec = normalize_rotvec_with_history(raw_rot_vec, self._prev_rotvec)
+                self._cached_pose = np.concatenate([actual_pose.translation, rot_vec])
+                self._cached_joints = actual_joints
+                self._cached_gripper_width = actual_gripper_half
+                self._cached_ee_force_torque = ee_force_torque
+                # 更新历史旋转矢量
+                self._prev_rotvec = raw_rot_vec.copy()
+
             try:
                 action = self._action_queue.get(timeout=CONTROL_DT * 2)
             except queue.Empty:
@@ -300,24 +420,68 @@ class FrankaEnv:
             if action is None:
                 if self._skill_stop.is_set():
                     break
-                # 超时/保持：以 min_jerk 插值维持在当前指令位姿
-                start_pose = commanded_pose
-                goal_pose = commanded_pose
+                # VLA 还未输出 action：继续执行上一个 action（保持运动连续性）
+                if hasattr(self, '_last_action') and self._last_action is not None:
+                    action = self._last_action.copy()  # 重复使用上一个 action
+                else:
+                    # 第一次还没有 action，保持不动
+                    start_pose = commanded_pose
+                    goal_pose = commanded_pose
+                    rot_vec = normalize_rotvec(Rotation.from_matrix(commanded_pose.rotation).as_rotvec())
+                    self._commanded_pose_array = np.concatenate([commanded_pose.translation, rot_vec])
+                    time.sleep(CONTROL_DT)
+                    continue  # 跳过后续处理
             else:
                 # 使用统一的变换逻辑
                 action = transform_action(action)
+                # 缓存 action 供下次使用
+                self._last_action = action.copy()
 
-                start_pose = commanded_pose
-                commanded_pose = self._compute_target_pose(commanded_pose, action[:6])
-                goal_pose = commanded_pose
+                # 安全检查：检查 commanded_pose 与实际位姿的差距
+                # actual_pose 已从上面的缓存读取中获得
+                pos_error = np.linalg.norm(commanded_pose.translation - actual_pose.translation)
+                # 正确计算旋转误差：通过相对旋转矩阵计算最短角度差
+                rot_diff = commanded_pose.rotation @ actual_pose.rotation.T
+                rot_angle = np.arccos(np.clip((np.trace(rot_diff) - 1) / 2, -1.0, 1.0))
+                
+                if pos_error > 0.2 or rot_angle > 1.5:  # 放宽到 20cm 或 86°
+                    warning_msg = (
+                        f"commanded_pose 偏离实际位姿过大，缓慢重置到实际位姿: "
+                        f"pos_error={pos_error:.3f}m (>0.2m), "
+                        f"rot_error={np.degrees(rot_angle):.1f}° (>86°)"
+                    )
+                    logger.warning(warning_msg)
+                    # 缓慢向 actual_pose 移动，避免突然跳跃
+                    # 降低插值比例到 5%，减少扭矩突变
+                    blend_factor = 0.05
+                    prev_commanded = commanded_pose.copy()
+                    commanded_pose.translation = commanded_pose.translation * (1 - blend_factor) + actual_pose.translation * blend_factor
+                    # 旋转使用 SLERP 插值
+                    R_current = prev_commanded.rotation
+                    R_target = actual_pose.rotation
+                    R_diff = R_current.T @ R_target
+                    rotvec_diff = Rotation.from_matrix(R_diff).as_rotvec()
+                    # 只移动 5%
+                    rotvec_step = rotvec_diff * blend_factor
+                    R_step = Rotation.from_rotvec(rotvec_step)
+                    commanded_pose.rotation = R_current @ R_step
+                    
+                    start_pose = prev_commanded  # 从上一帧的commanded_pose开始
+                    goal_pose = commanded_pose   # 到平滑后的commanded_pose
+                else:
+                    # 偏差正常，正常累加 delta
+                    start_pose = commanded_pose  # 从当前commanded_pose开始
+                    commanded_pose = self._compute_target_pose(commanded_pose, action[:6])
+                    goal_pose = commanded_pose   # 到累加delta后的commanded_pose
 
                 # 更新指令位姿缓存供外部（Coordinator）读取用于前端显示
-                rot_vec = Rotation.from_matrix(commanded_pose.rotation).as_rotvec()
+                rot_vec = normalize_rotvec(Rotation.from_matrix(commanded_pose.rotation).as_rotvec())
                 self._commanded_pose_array = np.concatenate([commanded_pose.translation, rot_vec])
 
                 # 夹爪二值化逻辑已在 transform_action 中处理
                 gripper_target = action[6]
                 if last_gripper is None or gripper_target != last_gripper:
+                    # goto_gripper 是异步调用，不会阻塞，不需要额外锁
                     fa.goto_gripper(gripper_target, block=False, speed=GRIPPER_SPEED)
                     last_gripper = gripper_target
 
@@ -339,8 +503,8 @@ class FrankaEnv:
                 impedance_proto = CartesianImpedanceSensorMessage(
                     id=msg_id,
                     timestamp=timestamp,
-                    translational_stiffnesses=FC.DEFAULT_TRANSLATIONAL_STIFFNESSES,
-                    rotational_stiffnesses=FC.DEFAULT_ROTATIONAL_STIFFNESSES,
+                    translational_stiffnesses=TRANSLATIONAL_STIFFNESS,
+                    rotational_stiffnesses=ROTATIONAL_STIFFNESS,
                 )
                 ros_msg = make_sensor_group_msg(
                     trajectory_generator_sensor_msg=sensor_proto2ros_msg(
@@ -380,6 +544,14 @@ class FrankaEnv:
     def commanded_pose_array(self) -> np.ndarray:
         return self._commanded_pose_array
 
+    @property
+    def ee_force_torque(self) -> np.ndarray:
+        """获取当前末端力矩信息 [force_x, force_y, force_z, torque_x, torque_y, torque_z]。"""
+        with self._lock:
+            if self._cached_ee_force_torque is None:
+                return np.zeros(6)
+            return self._cached_ee_force_torque.copy()
+
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
@@ -395,6 +567,6 @@ class FrankaEnv:
         angle = np.linalg.norm(delta_axisangle)
         if angle > 1e-6:
             delta_rot = Rotation.from_rotvec(delta_axisangle).as_matrix()
-            target.rotation = delta_rot @ current.rotation
+            target.rotation = delta_rot @ current.rotation  # delta 在基座坐标系表达，先应用 delta
 
         return target
