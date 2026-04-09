@@ -92,6 +92,7 @@ class KeyboardController:
         # 线程管理
         self._pub_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._reset_lock = threading.Lock()  # 防止并发复位
 
         # 状态缓存
         self._cached_gripper_width = self.fa.get_gripper_width()
@@ -283,52 +284,68 @@ class KeyboardController:
 
     def _reset(self):
         """平滑回到初始位姿（home）并打开夹爪。"""
-        print("  [复位] 回到初始位姿...")
+        # 防止并发复位
+        if not self._reset_lock.acquire(blocking=False):
+            print("  [复位] 正在复位中，请勿重复操作")
+            return
         
-        # 1. 打开夹爪
-        self.gripper_target = 0.08
-        self.fa.open_gripper(block=False)
-        
-        # 2. 通过 goto_pose 平滑移动到初始位姿
-        # 先停止当前的 dynamic skill
-        fa = self.fa
-        term_msg = ShouldTerminateSensorMessage(
-            timestamp=fa.get_time(), should_terminate=True
-        )
-        term_ros_msg = make_sensor_group_msg(
-            termination_handler_sensor_msg=sensor_proto2ros_msg(
-                term_msg, SensorDataMessageType.SHOULD_TERMINATE)
-        )
-        fa.publish_sensor_data(term_ros_msg)
-        time.sleep(0.5)
-        
-        # 回到 home 位姿（使用 FrankaConstants 的默认位姿）
-        home_pose = fa.get_pose()  # 获取当前位姿
-        # 使用 reset_joints 获取标准 home 位姿，但不阻塞
         try:
-            fa.reset_joints()
-        except Exception as e:
-            print(f"  [复位] 警告: reset_joints 异常: {e}")
-            # 如果失败，尝试使用 goto_joints
-            from frankapy import FrankaConstants as FC
-            fa.goto_joints(FC.DEFAULT_JOINT_POSITIONS, duration=3.0, block=True)
-        
-        time.sleep(0.5)
-        
-        # 3. 更新 commanded_pose 为新的 home 位姿
-        self._current_pose = self.fa.get_pose()
-        with self._pose_lock:
-            self._commanded_pose = self._current_pose.copy()
-            self._prev_commanded_pose = self._current_pose.copy()
-        
-        # 4. 重新启动 dynamic skill
-        self._stop_event.clear()
-        self.running = True
-        if self._pub_thread is None or not self._pub_thread.is_alive():
+            print("  [复位] 回到初始位姿...")
+            
+            # 1. 打开夹爪
+            self.gripper_target = 0.08
+            self.fa.open_gripper(block=False)
+            
+            # 2. 停止当前的 dynamic skill 和 publish_loop
+            self.running = False
+            self._stop_event.set()
+            
+            fa = self.fa
+            term_msg = ShouldTerminateSensorMessage(
+                timestamp=fa.get_time(), should_terminate=True
+            )
+            term_ros_msg = make_sensor_group_msg(
+                termination_handler_sensor_msg=sensor_proto2ros_msg(
+                    term_msg, SensorDataMessageType.SHOULD_TERMINATE)
+            )
+            fa.publish_sensor_data(term_ros_msg)
+            time.sleep(0.5)
+            
+            # 等待 publish_loop 线程退出
+            if self._pub_thread is not None and self._pub_thread.is_alive():
+                self._pub_thread.join(timeout=2.0)
+                self._pub_thread = None
+            
+            # 3. 回到 home 位姿
+            try:
+                fa.reset_joints()
+            except Exception as e:
+                print(f"  [复位] 警告: reset_joints 异常: {e}")
+                # 如果失败，尝试使用 goto_joints
+                from frankapy import FrankaConstants as FC
+                fa.goto_joints(FC.DEFAULT_JOINT_POSITIONS, duration=3.0, block=True)
+            
+            # 等待 ROS 节点完全稳定，避免 spin_once 重入
+            time.sleep(1.0)
+            
+            # 4. 更新 commanded_pose 为新的 home 位姿
+            self._current_pose = self.fa.get_pose()
+            with self._pose_lock:
+                self._commanded_pose = self._current_pose.copy()
+                self._prev_commanded_pose = self._current_pose.copy()
+            
+            # 5. 重新启动 dynamic skill 和 publish_loop
+            self._stop_event.clear()
+            self.running = True
             self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
             self._pub_thread.start()
-        
-        print("  [复位] 完成")
+            
+            # 等待新线程启动并初始化完成
+            time.sleep(0.5)
+            
+            print("  [复位] 完成")
+        finally:
+            self._reset_lock.release()
 
     # ------------------------------------------------------------------
     # 外部访问接口
@@ -342,6 +359,7 @@ class KeyboardController:
 
         其中 action = commanded_pose - prev_commanded_pose（用户输入的位姿增量）。
         旋转增量在基座坐标系中表达（与 vla_control 一致）。
+        action 格式与 vla_control 完全一致，可用于训练 VLA 模型。
         """
         with self._pose_lock:
             pos = self._current_pose.translation
@@ -367,10 +385,16 @@ class KeyboardController:
                 )
                 delta[3:6] = Rotation.from_matrix(diff_rot).as_rotvec()
             
-            # 夹爪目标：二值化（与 vla_control 的 transform_action 一致）
-            # vla_control: 0.0 if ta[6] >= 0 else 0.08（>=0 为闭合，<0 为打开）
-            # 但 data_collection 中 gripper_target 始终 >= 0，所以调整为：
-            # >= 0.04 为打开 (0.08)，< 0.04 为闭合 (0.0)
-            delta[6] = 0.08 if self.gripper_target >= 0.04 else 0.0
+            # 夹爪目标：与 vla_control 的 transform_action 完全一致
+            # vla_control: ta[6] = 0.0 if ta[6] >= 0 else 0.08
+            #   - ta[6] >= 0 → 0.0（闭合）
+            #   - ta[6] < 0  → 0.08（打开）
+            # 这里：gripper_target 表示期望开口宽度
+            #   - gripper_target < 0.04 → 闭合意图 → 输出 >= 0 的值 → transform 后为 0.0
+            #   - gripper_target >= 0.04 → 打开意图 → 输出 < 0 的值 → transform 后为 0.08
+            if self.gripper_target < 0.04:
+                delta[6] = 1.0   # 闭合意图，transform_action 会映射为 0.0
+            else:
+                delta[6] = -1.0  # 打开意图，transform_action 会映射为 0.08
 
             return state, delta
