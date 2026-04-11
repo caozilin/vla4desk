@@ -3,7 +3,7 @@
 Franka Panda 键盘遥操作控制器
 =============================
 提供：
-  - 20Hz dynamic skill 控制循环（发布 sensor message）
+  - 10Hz dynamic skill 控制循环（发布 sensor message）
   - 按键 → 位姿增量的映射（末端坐标系旋转，世界坐标系位置）
   - 命令位姿追踪（commanded_pose / prev_commanded_pose）
 
@@ -34,9 +34,10 @@ from frankapy.proto import (
 # 控制参数
 # ==================================================================
 
-PUBLISH_DT = 0.05           # 发布间隔 50ms (20Hz)
+PUBLISH_DT = 0.1            # 发布间隔 100ms (10Hz)
 MAX_LIN_VEL = 0.1          # 最大线速度 0.1 m/s
 MAX_ROT_VEL = math.pi / 4  # 最大角速度 45°/s
+GRIPPER_SPEED = 0.08       # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
 
 DEFAULT_TRANS_STIFF = FC.DEFAULT_TRANSLATIONAL_STIFFNESSES
 DEFAULT_ROT_STIFF = FC.DEFAULT_ROTATIONAL_STIFFNESSES
@@ -167,7 +168,7 @@ class KeyboardController:
     # ------------------------------------------------------------------
 
     def _publish_loop(self):
-        """20Hz 动态控制循环：读取按键 → 更新 commanded_pose → 发布 sensor message"""
+        """10Hz 动态控制循环：读取按键 → 更新 commanded_pose → 发布 sensor message"""
         fa = self.fa
         seq_id = 0
 
@@ -197,11 +198,17 @@ class KeyboardController:
             speed = self.step_size
 
             # 计算位姿增量
-            dx = (int('w' in keys) - int('s' in keys)) * MAX_DELTA_POS * speed
-            dy = (int('a' in keys) - int('d' in keys)) * MAX_DELTA_POS * speed
-            dz = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_POS * speed
-            droll  = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
-            dpitch = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_ROT * speed
+            # ws: x轴（反向：w=负，s=正）
+            dx = (int('s' in keys) - int('w' in keys)) * MAX_DELTA_POS * speed
+            # ad: y轴（反向：a=负，d=正）
+            dy = (int('d' in keys) - int('a' in keys)) * MAX_DELTA_POS * speed
+            # ik: z轴上下（i=上，k=下）
+            dz = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_POS * speed
+            # qe: 绕x轴正反转
+            droll  = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_ROT * speed
+            # uo: 绕y轴正反转
+            dpitch = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
+            # lj: 绕z轴正反转
             dyaw   = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
 
             moved = dx or dy or dz or droll or dpitch or dyaw
@@ -270,17 +277,17 @@ class KeyboardController:
     def _close_gripper(self):
         print("  [夹爪] 关闭")
         self.gripper_target = 0.0
-        self.fa.goto_gripper(width=0.0, grasp=True, block=False)
+        self.fa.goto_gripper(width=0.0, grasp=True, block=False, speed=GRIPPER_SPEED)
 
     def _open_gripper(self):
         print("  [夹爪] 打开")
         self.gripper_target = 0.08
-        self.fa.open_gripper(block=False)
+        self.fa.goto_gripper(width=0.08, block=False, speed=GRIPPER_SPEED)
 
     def _half_gripper(self):
         print("  [夹爪] 半开 (0.04m)")
         self.gripper_target = 0.04
-        self.fa.goto_gripper(width=0.04, block=False)
+        self.fa.goto_gripper(width=0.04, block=False, speed=GRIPPER_SPEED)
 
     def _reset(self):
         """平滑回到初始位姿（home）并打开夹爪。"""

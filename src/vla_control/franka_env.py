@@ -44,9 +44,9 @@ except ImportError:
 
 from scipy.spatial.transform import Rotation
 
-CONTROL_DT = 0.1   # 每个 action 的执行周期（s），决定控制频率
-INTERP_DT = 0.02   # 50Hz：每次 sensor message 间隔（与示例一致）
-INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
+CONTROL_DT = 0.1   # 每个 action 的执行周期（s），决定控制频率（10Hz）
+INTERP_DT = 0.01   # 100Hz：每次 sensor message 间隔
+INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 10
 
 POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
 ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]

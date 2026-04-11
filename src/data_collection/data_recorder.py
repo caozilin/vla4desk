@@ -9,7 +9,7 @@ Franka Panda 数据采集框架
 命令行参数：
     --collection_dir  数据根目录 (默认: ~/franka_data/collected)
     --task_name       任务子目录名   (默认: default)
-    --collect_hz      采集频率 Hz     (默认: 20)
+    --collect_hz      采集频率 Hz     (默认: 10)
     --max_frames      每段轨迹最大帧数 (默认: 1000)
 
 保存格式：
