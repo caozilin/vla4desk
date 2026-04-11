@@ -16,6 +16,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,30 @@ def transform_action(action: np.ndarray) -> np.ndarray:
     ta = action.copy()
     ta[:3] = np.clip(ta[:3], -POS_CLIP, POS_CLIP) * POS_SCALE
     ta[3:6] = np.clip(ta[3:6], -ROT_CLIP, ROT_CLIP) * ROT_SCALE
+    ta[6] = 0.0 if ta[6] >= 0 else 0.08
+    return ta
+
+
+@dataclass
+class ActionTransformConfig:
+    pos_clip: float = POS_CLIP
+    rot_clip: float = ROT_CLIP
+    pos_max_vel: float = POS_MAX_VEL
+    rot_max_vel: float = ROT_MAX_VEL
+
+
+def _apply_action_transform(
+    action: np.ndarray,
+    config: ActionTransformConfig,
+    *,
+    scale_motion: bool = True,
+) -> np.ndarray:
+    ta = np.asarray(action, dtype=np.float64).copy()
+    if scale_motion:
+        pos_scale = config.pos_max_vel * CONTROL_DT / config.pos_clip
+        rot_scale = config.rot_max_vel * CONTROL_DT / config.rot_clip
+        ta[:3] = np.clip(ta[:3], -config.pos_clip, config.pos_clip) * pos_scale
+        ta[3:6] = np.clip(ta[3:6], -config.rot_clip, config.rot_clip) * rot_scale
     ta[6] = 0.0 if ta[6] >= 0 else 0.08
     return ta
 
@@ -236,6 +261,10 @@ class FrankaEnv:
         cam2_serial: str | None = None,
         dynamic_duration: float = 60.0,
         no_robot: bool = False,
+        pos_clip: float = POS_CLIP,
+        rot_clip: float = ROT_CLIP,
+        pos_max_vel: float = POS_MAX_VEL,
+        rot_max_vel: float = ROT_MAX_VEL,
     ):
         if no_robot or not HAS_FRANKA:
             if not no_robot:
@@ -246,6 +275,12 @@ class FrankaEnv:
 
         self._cameras = DualD435(cam1_serial, cam2_serial)
         self._dynamic_duration = dynamic_duration
+        self._action_transform = ActionTransformConfig(
+            pos_clip=pos_clip,
+            rot_clip=rot_clip,
+            pos_max_vel=pos_max_vel,
+            rot_max_vel=rot_max_vel,
+        )
 
         # 动作队列：coordinator 往里放 action，_skill_thread 消费
         self._action_queue: queue.Queue = queue.Queue()
@@ -283,6 +318,26 @@ class FrankaEnv:
             return
         self._stop_skill_thread()
         self._fa.reset_joints()
+
+    def set_action_transform(
+        self,
+        *,
+        pos_clip: float | None = None,
+        rot_clip: float | None = None,
+        pos_max_vel: float | None = None,
+        rot_max_vel: float | None = None,
+    ):
+        if pos_clip is not None:
+            self._action_transform.pos_clip = pos_clip
+        if rot_clip is not None:
+            self._action_transform.rot_clip = rot_clip
+        if pos_max_vel is not None:
+            self._action_transform.pos_max_vel = pos_max_vel
+        if rot_max_vel is not None:
+            self._action_transform.rot_max_vel = rot_max_vel
+
+    def transform_action(self, action: np.ndarray, *, scale_motion: bool = True) -> np.ndarray:
+        return _apply_action_transform(action, self._action_transform, scale_motion=scale_motion)
 
     # ------------------------------------------------------------------
     # obs 采集
@@ -432,8 +487,10 @@ class FrankaEnv:
                     time.sleep(CONTROL_DT)
                     continue  # 跳过后续处理
             else:
-                # 使用统一的变换逻辑
-                action = transform_action(action)
+                should_transform = True
+                if isinstance(action, tuple):
+                    action, should_transform = action
+                action = self.transform_action(action, scale_motion=should_transform)
                 # 缓存 action 供下次使用
                 self._last_action = action.copy()
 
@@ -530,9 +587,9 @@ class FrankaEnv:
         fa.publish_sensor_data(ros_msg)
         logger.info("dynamic skill 已终止")
 
-    def enqueue_action(self, action: np.ndarray):
+    def enqueue_action(self, action: np.ndarray, *, transform: bool = True):
         """外部调用：将一个 action 放入队列，由 _skill_loop 消费。"""
-        self._action_queue.put(action)
+        self._action_queue.put((np.asarray(action, dtype=np.float64), transform))
 
     def hold_pose(self):
         """外部调用：放一个 None 进队列，让 _skill_loop 保持当前位姿一拍。"""
