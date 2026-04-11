@@ -3,7 +3,9 @@
 Franka Panda 键盘遥操作控制器
 =============================
 提供：
-  - 10Hz dynamic skill 控制循环（发布 sensor message）
+  - 双频率控制循环：
+    * 10Hz 输入采样：读取按键并计算 action 增量
+    * 100Hz 发布循环：对 action 增量线性插值，平滑发布目标位姿
   - 按键 → 位姿增量的映射（末端坐标系旋转，世界坐标系位置）
   - 命令位姿追踪（commanded_pose / prev_commanded_pose）
 
@@ -17,6 +19,7 @@ import time
 
 import numpy as np
 
+from frankapy.utils import min_jerk, min_jerk_weight
 from pynput import keyboard
 from scipy.spatial.transform import Rotation
 
@@ -34,17 +37,17 @@ from frankapy.proto import (
 # 控制参数
 # ==================================================================
 
-PUBLISH_DT = 0.1            # 发布间隔 100ms (10Hz)
-MAX_LIN_VEL = 0.1          # 最大线速度 0.1 m/s
-MAX_ROT_VEL = math.pi / 4  # 最大角速度 45°/s
-GRIPPER_SPEED = 0.08       # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
+INPUT_DT = 0.1               # 输入采样间隔 100ms (10Hz) - 读取按键并计算action增量
+PUBLISH_DT = 0.02             # 发布间隔 20ms (50Hz) - 对action增量进行min_jerk插值后发布
+MAX_LIN_VEL = 0.1             # 最大线速度 0.1 m/s
+MAX_ROT_VEL = math.pi / 4     # 最大角速度 45°/s
+GRIPPER_SPEED = 0.08          # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
 
 DEFAULT_TRANS_STIFF = FC.DEFAULT_TRANSLATIONAL_STIFFNESSES
 DEFAULT_ROT_STIFF = FC.DEFAULT_ROTATIONAL_STIFFNESSES
 
-# 每步最大增量（由 PUBLISH_DT 决定）
-MAX_DELTA_POS = MAX_LIN_VEL * PUBLISH_DT   # 0.005 m
-MAX_DELTA_ROT = MAX_ROT_VEL * PUBLISH_DT   # ≈ 0.039 rad
+MAX_DELTA_POS = MAX_LIN_VEL * INPUT_DT     # 0.01 m
+MAX_DELTA_ROT = MAX_ROT_VEL * INPUT_DT     # ≈ 0.0785 rad
 
 
 # ==================================================================
@@ -104,9 +107,8 @@ class KeyboardController:
 
     def start(self):
         """启动控制线程（daemon），不阻塞。"""
-        if self._pub_thread is None or not self._pub_thread.is_alive():
-            self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
-            self._pub_thread.start()
+        # 直接调用复位操作来初始化
+        self._reset()
 
     def stop(self):
         """停止控制线程，等待其退出。"""
@@ -168,16 +170,22 @@ class KeyboardController:
     # ------------------------------------------------------------------
 
     def _publish_loop(self):
-        """10Hz 动态控制循环：读取按键 → 更新 commanded_pose → 发布 sensor message"""
+        """控制循环 (50Hz)：
+        - 读取按键并计算 action 增量
+        - 使用 min_jerk 插值生成平滑轨迹
+        - 发布目标位姿
+        """
         fa = self.fa
         seq_id = 0
 
-        # 初始化位姿
         self._current_pose = fa.get_pose()
         self._commanded_pose = self._current_pose.copy()
         self._prev_commanded_pose = self._current_pose.copy()
 
-        # 启动 dynamic skill
+        self._trajectory: list[RigidTransform] = []
+        self._trajectory_index = 0
+        self._trajectory_start_time = 0.0
+
         fa.goto_pose(
             self._commanded_pose,
             duration=1000.0,
@@ -188,78 +196,82 @@ class KeyboardController:
         )
         init_time = fa.get_time()
 
+        last_input_time = time.time()
+
         while self.running and not self._stop_event.is_set():
             t_loop_start = time.time()
             timestamp = fa.get_time() - init_time
+            current_time = time.time()
 
-            # 读取按键状态（安全复制）
-            with self._keys_lock:
-                keys = set(self.keys_pressed)
-            speed = self.step_size
+            if current_time - last_input_time >= INPUT_DT:
+                last_input_time = current_time
 
-            # 计算位姿增量
-            # ws: x轴（反向：w=负，s=正）
-            dx = (int('s' in keys) - int('w' in keys)) * MAX_DELTA_POS * speed
-            # ad: y轴（反向：a=负，d=正）
-            dy = (int('d' in keys) - int('a' in keys)) * MAX_DELTA_POS * speed
-            # ik: z轴上下（i=上，k=下）
-            dz = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_POS * speed
-            # qe: 绕x轴正反转
-            droll  = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_ROT * speed
-            # uo: 绕y轴正反转
-            dpitch = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
-            # lj: 绕z轴正反转
-            dyaw   = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
+                with self._keys_lock:
+                    keys = set(self.keys_pressed)
+                speed = self.step_size
 
-            moved = dx or dy or dz or droll or dpitch or dyaw
+                dx = (int('s' in keys) - int('w' in keys)) * MAX_DELTA_POS * speed
+                dy = (int('d' in keys) - int('a' in keys)) * MAX_DELTA_POS * speed
+                dz = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_POS * speed
+                droll  = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_ROT * speed
+                dpitch = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
+                dyaw   = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
 
-            with self._pose_lock:
+                moved = dx or dy or dz or droll or dpitch or dyaw
+
                 if moved:
                     self._prev_commanded_pose = self._commanded_pose.copy()
 
-                    # 位置增量：直接累加（基座坐标系）
                     self._commanded_pose.translation[0] += dx
                     self._commanded_pose.translation[1] += dy
                     self._commanded_pose.translation[2] += dz
 
-                    # 旋转增量：基座坐标系，左乘（与 vla_control 一致）
                     if droll or dpitch or dyaw:
                         delta_rotvec = np.array([droll, dpitch, dyaw])
                         angle = np.linalg.norm(delta_rotvec)
                         if angle > 1e-6:
                             delta_rot = Rotation.from_rotvec(delta_rotvec).as_matrix()
-                            # 左乘：delta 在基座坐标系表达
                             self._commanded_pose.rotation = delta_rot @ self._commanded_pose.rotation
 
-                # 更新缓存
+                    ts = np.arange(0, INPUT_DT + PUBLISH_DT, PUBLISH_DT)
+                    weights = [min_jerk_weight(t, INPUT_DT) for t in ts]
+                    self._trajectory = [
+                        self._prev_commanded_pose.interpolate_with(self._commanded_pose, w)
+                        for w in weights
+                    ]
+                    self._trajectory_index = 0
+                    self._trajectory_start_time = timestamp
+
                 self._current_pose = fa.get_pose()
                 self._cached_gripper_width = fa.get_gripper_width()
 
-            # 发布 sensor message
-            msg_pose = PosePositionSensorMessage(
-                id=seq_id, timestamp=timestamp,
-                position=self._commanded_pose.translation,
-                quaternion=self._commanded_pose.quaternion
-            )
-            msg_imp = CartesianImpedanceSensorMessage(
-                id=seq_id, timestamp=timestamp,
-                translational_stiffnesses=DEFAULT_TRANS_STIFF,
-                rotational_stiffnesses=DEFAULT_ROT_STIFF
-            )
-            ros_msg = make_sensor_group_msg(
-                trajectory_generator_sensor_msg=sensor_proto2ros_msg(
-                    msg_pose, SensorDataMessageType.POSE_POSITION),
-                feedback_controller_sensor_msg=sensor_proto2ros_msg(
-                    msg_imp, SensorDataMessageType.CARTESIAN_IMPEDANCE)
-            )
-            fa.publish_sensor_data(ros_msg)
-            seq_id += 1
+            if self._trajectory and self._trajectory_index < len(self._trajectory):
+                target_pose = self._trajectory[self._trajectory_index]
+                traj_time = timestamp - self._trajectory_start_time
 
-            # 精确延时
+                msg_pose = PosePositionSensorMessage(
+                    id=seq_id, timestamp=traj_time,
+                    position=target_pose.translation,
+                    quaternion=target_pose.quaternion
+                )
+                msg_imp = CartesianImpedanceSensorMessage(
+                    id=seq_id, timestamp=traj_time,
+                    translational_stiffnesses=DEFAULT_TRANS_STIFF,
+                    rotational_stiffnesses=DEFAULT_ROT_STIFF
+                )
+                ros_msg = make_sensor_group_msg(
+                    trajectory_generator_sensor_msg=sensor_proto2ros_msg(
+                        msg_pose, SensorDataMessageType.POSE_POSITION),
+                    feedback_controller_sensor_msg=sensor_proto2ros_msg(
+                        msg_imp, SensorDataMessageType.CARTESIAN_IMPEDANCE)
+                )
+                fa.publish_sensor_data(ros_msg)
+                self._trajectory_index += 1
+                seq_id += 1
+
             elapsed = time.time() - t_loop_start
             time.sleep(max(0, PUBLISH_DT - elapsed))
 
-        # 停止 dynamic skill
         term_msg = ShouldTerminateSensorMessage(
             timestamp=fa.get_time() - init_time, should_terminate=True
         )
