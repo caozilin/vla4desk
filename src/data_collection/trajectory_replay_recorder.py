@@ -144,6 +144,42 @@ class TrajectoryReplayRecorder:
             no_robot=no_robot,
         )
 
+    def _prepare_env(self):
+        self.env.start()
+        if not self.no_robot:
+            logging.info("回放前复位到 home...")
+            self.env.reset_to_home()
+        self.env.start_skill_thread()
+        time.sleep(1.0)
+
+    def _record_sample(self, sample: dict[str, list[float]]):
+        obs, _, _ = self.env.get_observation(self.prompt)
+        state = obs["observation/state"].astype(np.float64).tolist()
+        action = np.asarray(sample["action"], dtype=np.float64)
+        self.logged_rows.append(
+            {
+                "state": state,
+                "action": action.tolist(),
+            }
+        )
+        self.env.enqueue_action(action, transform=False)
+
+    def _sleep_until(self, next_tick: float):
+        remaining = next_tick - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _build_output_meta(self) -> dict:
+        return {
+            "task_name": self.output_dir.name,
+            "collect_hz": self.replay_hz,
+            "max_frames": len(self.logged_rows),
+            "num_frames": len(self.logged_rows),
+            "source_episode": str(self.episode_dir),
+            "source_csv": str(self.source_csv),
+            "speed_factor": self.speed,
+        }
+
     def run(self):
         logging.info("加载轨迹: %s", self.source_csv)
         logging.info("源轨迹帧数: %d", len(self.samples))
@@ -155,47 +191,21 @@ class TrajectoryReplayRecorder:
                 1.0 / CONTROL_DT,
             )
 
-        self.env.start()
-        if not self.no_robot:
-            logging.info("回放前复位到 home...")
-            self.env.reset_to_home()
-        self.env.start_skill_thread()
-        time.sleep(1.0)
+        self._prepare_env()
 
         try:
             next_tick = time.monotonic()
             for index, sample in enumerate(self.samples, start=1):
-                obs, _, _ = self.env.get_observation(self.prompt)
-                state = obs["observation/state"].astype(np.float64).tolist()
-                action = np.asarray(sample["action"], dtype=np.float64)
-
-                self.logged_rows.append(
-                    {
-                        "state": state,
-                        "action": action.tolist(),
-                    }
-                )
-                self.env.enqueue_action(action, transform=False)
-
+                self._record_sample(sample)
                 next_tick += self.dt
-                remaining = next_tick - time.monotonic()
-                if remaining > 0:
-                    time.sleep(remaining)
+                self._sleep_until(next_tick)
 
                 if index % max(1, int(round(self.replay_hz))) == 0 or index == len(self.samples):
                     logging.info("回放进度: %d / %d", index, len(self.samples))
         finally:
             self.env.stop()
 
-        meta = {
-            "task_name": self.output_dir.name,
-            "collect_hz": self.replay_hz,
-            "max_frames": len(self.logged_rows),
-            "num_frames": len(self.logged_rows),
-            "source_episode": str(self.episode_dir),
-            "source_csv": str(self.source_csv),
-            "speed_factor": self.speed,
-        }
+        meta = self._build_output_meta()
         csv_path = _save_csv(self.output_dir, meta, self.logged_rows)
         logging.info("replay 记录已保存: %s", csv_path)
 

@@ -4,6 +4,7 @@ obs 格式（发给 openpi 服务端）：
     observation/image       : (224, 224, 3) uint8  外部相机
     observation/wrist_image : (224, 224, 3) uint8  腕部相机
     observation/state       : (8,) float64  [eef_pos(3), eef_axisangle(3), finger1_qpos(1), finger2_qpos(1)]
+    observation/joints      : (7,) float64  机械臂 7 维关节角
     prompt                  : str
 
 action 格式（从 openpi 服务端接收）：
@@ -46,20 +47,20 @@ except ImportError:
 from scipy.spatial.transform import Rotation
 
 CONTROL_DT = 0.1   # 每个 action 的执行周期（s），决定控制频率（10Hz）
-INTERP_DT = 0.01   # 100Hz：每次 sensor message 间隔
-INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 10
+INTERP_DT = 0.02   # 50Hz：与 key_control 的发布频率一致
+INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
 
 POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
 ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
-POS_MAX_VEL = 0.1  /3     # 末端位置最大速度 (m/s)
-ROT_MAX_VEL = math.pi / 2 /3   # 末端旋转最大速度 (rad/s)
+POS_MAX_VEL = 0.1 / 3      # 末端位置最大速度 (m/s)
+ROT_MAX_VEL = (math.pi / 4) / 3   # 末端旋转最大速度 (rad/s)
 GRIPPER_SPEED = 0.08    # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
 POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
 ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
 
-# 阻抗控制刚度参数
-TRANSLATIONAL_STIFFNESS = [600.0, 600.0, 600.0]  # 平移刚度 [x, y, z] (N/m)，原始值 [600, 600, 600]
-ROTATIONAL_STIFFNESS = [50.0, 50.0, 50.0]        # 旋转刚度 [ax, ay, az] (Nm/rad)，原始值 [50, 50, 50]
+# 阻抗控制刚度参数，与 key_control 保持一致
+TRANSLATIONAL_STIFFNESS = FC.DEFAULT_TRANSLATIONAL_STIFFNESSES if HAS_FRANKA else [600.0, 600.0, 600.0]
+ROTATIONAL_STIFFNESS = FC.DEFAULT_ROTATIONAL_STIFFNESSES if HAS_FRANKA else [50.0, 50.0, 50.0]
 
 
 def transform_action(action: np.ndarray) -> np.ndarray:
@@ -308,6 +309,13 @@ class FrankaEnv:
         self._cameras.start()
 
     def stop(self):
+        self.stop_control()
+
+    def start_control(self):
+        self.start()
+        self.start_skill_thread()
+
+    def stop_control(self):
         self._stop_skill_thread()
         self._cameras.stop()
 
@@ -318,6 +326,10 @@ class FrankaEnv:
             return
         self._stop_skill_thread()
         self._fa.reset_joints()
+
+    def home_and_restart(self):
+        self.reset_to_home()
+        self.start_skill_thread()
 
     def set_action_transform(
         self,
@@ -339,6 +351,167 @@ class FrankaEnv:
     def transform_action(self, action: np.ndarray, *, scale_motion: bool = True) -> np.ndarray:
         return _apply_action_transform(action, self._action_transform, scale_motion=scale_motion)
 
+    def _resize_observation_image(self, image: np.ndarray) -> np.ndarray:
+        return image_tools.convert_to_uint8(image_tools.resize_with_pad(image, RESIZE, RESIZE))
+
+    def _pose_to_rotvec(self, pose: "RigidTransform") -> np.ndarray:
+        return Rotation.from_matrix(pose.rotation).as_rotvec()
+
+    def _set_commanded_pose_array(self, pose: "RigidTransform"):
+        rot_vec = normalize_rotvec(self._pose_to_rotvec(pose))
+        self._commanded_pose_array = np.concatenate([pose.translation, rot_vec])
+
+    def _read_robot_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        pose_rt = self._fa.get_pose()
+        joints = self._fa.get_joints()
+        half = self._fa.get_gripper_width() / 2.0
+        return pose_rt.translation, self._pose_to_rotvec(pose_rt), joints, half
+
+    def _get_robot_state_for_observation(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        with self._lock:
+            if (
+                self._cached_pose is not None
+                and self._cached_joints is not None
+                and self._cached_gripper_width is not None
+            ):
+                return (
+                    self._cached_pose[:3],
+                    self._cached_pose[3:6],
+                    self._cached_joints,
+                    self._cached_gripper_width,
+                )
+        return self._read_robot_state()
+
+    def _build_observation_state(
+        self,
+        pos: np.ndarray,
+        rot: np.ndarray,
+        half_gripper_width: float,
+    ) -> np.ndarray:
+        return np.concatenate([
+            pos,
+            rot,
+            [+half_gripper_width],
+            [-half_gripper_width],
+        ])
+
+    def _refresh_robot_cache(self):
+        with self._lock:
+            actual_pose = self._fa.get_pose()
+            actual_joints = self._fa.get_joints()
+            actual_gripper_half = self._fa.get_gripper_width() / 2.0
+            ee_force_torque = self._fa.get_ee_force_torque()
+            raw_rot_vec = self._pose_to_rotvec(actual_pose)
+            rot_vec = normalize_rotvec_with_history(raw_rot_vec, self._prev_rotvec)
+
+            self._cached_pose = np.concatenate([actual_pose.translation, rot_vec])
+            self._cached_joints = actual_joints
+            self._cached_gripper_width = actual_gripper_half
+            self._cached_ee_force_torque = ee_force_torque
+            self._prev_rotvec = raw_rot_vec.copy()
+
+    def _start_dynamic_skill(self, fa: "FrankaArm") -> tuple["RigidTransform", float]:
+        logger.info("等待机械臂状态同步...")
+        time.sleep(1.0)
+        current_pose = fa.get_pose()
+
+        logger.info("启动 dynamic skill...")
+        fa.goto_pose(
+            current_pose,
+            duration=self._dynamic_duration,
+            dynamic=True,
+            buffer_time=20.0,
+            cartesian_impedances=TRANSLATIONAL_STIFFNESS + ROTATIONAL_STIFFNESS,
+            block=False,
+        )
+        init_time = fa.get_time()
+        self._set_commanded_pose_array(current_pose)
+        logger.info("dynamic skill 就绪，开始接收 action")
+        return current_pose.copy(), init_time
+
+    def _next_action(self):
+        try:
+            return self._action_queue.get(timeout=CONTROL_DT * 2)
+        except queue.Empty:
+            return None
+
+    def _resolve_goal_pose(self, commanded_pose: "RigidTransform", action):
+        if action is None:
+            return commanded_pose, commanded_pose, None
+
+        should_transform = True
+        if isinstance(action, tuple):
+            action, should_transform = action
+
+        transformed_action = self.transform_action(action, scale_motion=should_transform)
+        goal_pose = self._compute_target_pose(commanded_pose, transformed_action[:6])
+        return commanded_pose, goal_pose, transformed_action
+
+    def _maybe_update_gripper(
+        self,
+        fa: "FrankaArm",
+        action: np.ndarray,
+        last_gripper: float | None,
+    ) -> float:
+        gripper_target = action[6]
+        if last_gripper is None or gripper_target != last_gripper:
+            fa.goto_gripper(gripper_target, block=False, speed=GRIPPER_SPEED)
+            return gripper_target
+        return last_gripper
+
+    def _publish_interp_pose(
+        self,
+        fa: "FrankaArm",
+        start_pose: "RigidTransform",
+        goal_pose: "RigidTransform",
+        init_time: float,
+        msg_id: int,
+    ) -> int:
+        ts = np.arange(INTERP_DT, CONTROL_DT + INTERP_DT * 0.5, INTERP_DT)
+        for t in ts:
+            if self._skill_stop.is_set():
+                break
+            w = min_jerk_weight(t, CONTROL_DT)
+            interp_pose = goal_pose.interpolate_with(start_pose, 1.0 - w)
+            msg_id += 1
+            timestamp = fa.get_time() - init_time
+            traj_proto = PosePositionSensorMessage(
+                id=msg_id,
+                timestamp=timestamp,
+                position=interp_pose.translation,
+                quaternion=interp_pose.quaternion,
+            )
+            impedance_proto = CartesianImpedanceSensorMessage(
+                id=msg_id,
+                timestamp=timestamp,
+                translational_stiffnesses=TRANSLATIONAL_STIFFNESS,
+                rotational_stiffnesses=ROTATIONAL_STIFFNESS,
+            )
+            ros_msg = make_sensor_group_msg(
+                trajectory_generator_sensor_msg=sensor_proto2ros_msg(
+                    traj_proto, SensorDataMessageType.POSE_POSITION
+                ),
+                feedback_controller_sensor_msg=sensor_proto2ros_msg(
+                    impedance_proto, SensorDataMessageType.CARTESIAN_IMPEDANCE
+                ),
+            )
+            fa.publish_sensor_data(ros_msg)
+            time.sleep(INTERP_DT)
+        return msg_id
+
+    def _publish_termination(self, fa: "FrankaArm", init_time: float):
+        timestamp = fa.get_time() - init_time
+        term_msg = ShouldTerminateSensorMessage(
+            timestamp=timestamp, should_terminate=True
+        )
+        ros_msg = make_sensor_group_msg(
+            termination_handler_sensor_msg=sensor_proto2ros_msg(
+                term_msg, SensorDataMessageType.SHOULD_TERMINATE
+            )
+        )
+        fa.publish_sensor_data(ros_msg)
+        logger.info("dynamic skill 已终止")
+
     # ------------------------------------------------------------------
     # obs 采集
     # ------------------------------------------------------------------
@@ -346,38 +519,12 @@ class FrankaEnv:
     def get_observation(self, prompt: str) -> dict:
         img1, img2 = self._cameras.get_frames()
 
-        img1_resized = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(img1, RESIZE, RESIZE)
-        )
-        img2_resized = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(img2, RESIZE, RESIZE)
-        )
+        img1_resized = self._resize_observation_image(img1)
+        img2_resized = self._resize_observation_image(img2)
 
         if self._fa is not None:
-            # 从缓存读取，避免重复调用 ROS API（_skill_loop 会定期更新缓存）
-            with self._lock:
-                if self._cached_pose is None or self._cached_joints is None or self._cached_gripper_width is None:
-                    # 首次调用，需要从 ROS 读取
-                    pose_rt = self._fa.get_pose()
-                    joints = self._fa.get_joints()
-                    half = self._fa.get_gripper_width() / 2.0
-                    # 直接用 pose_rt 构建 state（轴角）
-                    from scipy.spatial.transform import Rotation
-                    pos = pose_rt.translation
-                    rot = Rotation.from_matrix(pose_rt.rotation).as_rotvec()
-                else:
-                    # 使用缓存
-                    pos = self._cached_pose[:3]
-                    rot = self._cached_pose[3:6]
-                    joints = self._cached_joints
-                    half = self._cached_gripper_width
-            
-            state = np.concatenate([
-                pos,                             # (3,) eef pos (基座坐标系)
-                rot,                             # (3,) eef rot (axisangle, 基座坐标系)
-                [+half],                         # (1,) finger1 qpos
-                [-half],                         # (1,) finger2 qpos
-            ])
+            pos, rot, joints, half = self._get_robot_state_for_observation()
+            state = self._build_observation_state(pos, rot, half)
         else:
             state = np.zeros(8, dtype=np.float64)
             joints = np.zeros(7, dtype=np.float64)
@@ -414,7 +561,10 @@ class FrankaEnv:
         self._action_queue.put(None)
         if self._skill_thread is not None:
             self._skill_thread.join(timeout=3.0)
-            self._skill_thread = None
+            if self._skill_thread.is_alive():
+                logger.warning("dynamic skill 线程在 3.0s 内未退出，保留线程引用并阻止重复启动")
+            else:
+                self._skill_thread = None
 
     def _skill_loop(self):
         """
@@ -427,165 +577,47 @@ class FrankaEnv:
             return
 
         fa = self._fa
-        # 【只会在这里执行一次】
-        logger.info("等待机械臂状态同步...")
-        time.sleep(1.0)
-        current_pose = fa.get_pose()
+        thread = threading.current_thread()
+        init_time: float | None = None
 
-        logger.info("启动 dynamic skill...")
-        fa.goto_pose(
-            current_pose,
-            duration=self._dynamic_duration,
-            dynamic=True,
-            buffer_time=10,
-        )
-        init_time = fa.get_time()
-        msg_id = 0
-        # 维护指令位姿（commanded pose），在其基础上叠加 delta，而非实际位姿
-        commanded_pose = current_pose.copy()
-        # 立即更新 commanded_pose_array，避免外部读取到初始的零值
-        rot_vec = normalize_rotvec(Rotation.from_matrix(commanded_pose.rotation).as_rotvec())
-        self._commanded_pose_array = np.concatenate([commanded_pose.translation, rot_vec])
-        logger.info("dynamic skill 就绪，开始接收 action")
+        try:
+            commanded_pose, init_time = self._start_dynamic_skill(fa)
+            msg_id = 0
+            last_gripper: float | None = None
 
-        last_gripper: float | None = None
+            while not self._skill_stop.is_set():
+                self._refresh_robot_cache()
 
-        while not self._skill_stop.is_set():
-            # 每个控制周期读取一次实际位姿和末端力矩，更新缓存供 get_observation 使用
+                action = self._next_action()
+                if action is None and self._skill_stop.is_set():
+                    break
+
+                start_pose, goal_pose, transformed_action = self._resolve_goal_pose(commanded_pose, action)
+                commanded_pose = goal_pose
+                self._set_commanded_pose_array(commanded_pose)
+
+                if transformed_action is not None:
+                    last_gripper = self._maybe_update_gripper(fa, transformed_action, last_gripper)
+
+                msg_id = self._publish_interp_pose(
+                    fa,
+                    start_pose,
+                    goal_pose,
+                    init_time,
+                    msg_id,
+                )
+        except Exception:
+            logger.exception("dynamic skill 线程异常退出")
+            raise
+        finally:
+            if init_time is not None:
+                try:
+                    self._publish_termination(fa, init_time)
+                except Exception:
+                    logger.exception("发送 dynamic skill 终止消息失败")
             with self._lock:
-                actual_pose = fa.get_pose()
-                actual_joints = fa.get_joints()
-                actual_gripper_half = fa.get_gripper_width() / 2.0
-                ee_force_torque = fa.get_ee_force_torque()
-                # 更新缓存（使用历史信息规范化旋转矢量，处理奇异性）
-                raw_rot_vec = Rotation.from_matrix(actual_pose.rotation).as_rotvec()
-                rot_vec = normalize_rotvec_with_history(raw_rot_vec, self._prev_rotvec)
-                self._cached_pose = np.concatenate([actual_pose.translation, rot_vec])
-                self._cached_joints = actual_joints
-                self._cached_gripper_width = actual_gripper_half
-                self._cached_ee_force_torque = ee_force_torque
-                # 更新历史旋转矢量
-                self._prev_rotvec = raw_rot_vec.copy()
-
-            try:
-                action = self._action_queue.get(timeout=CONTROL_DT * 2)
-            except queue.Empty:
-                action = None
-
-            if action is None:
-                if self._skill_stop.is_set():
-                    break
-                # VLA 还未输出 action：继续执行上一个 action（保持运动连续性）
-                if hasattr(self, '_last_action') and self._last_action is not None:
-                    action = self._last_action.copy()  # 重复使用上一个 action
-                else:
-                    # 第一次还没有 action，保持不动
-                    start_pose = commanded_pose
-                    goal_pose = commanded_pose
-                    rot_vec = normalize_rotvec(Rotation.from_matrix(commanded_pose.rotation).as_rotvec())
-                    self._commanded_pose_array = np.concatenate([commanded_pose.translation, rot_vec])
-                    time.sleep(CONTROL_DT)
-                    continue  # 跳过后续处理
-            else:
-                should_transform = True
-                if isinstance(action, tuple):
-                    action, should_transform = action
-                action = self.transform_action(action, scale_motion=should_transform)
-                # 缓存 action 供下次使用
-                self._last_action = action.copy()
-
-                # 安全检查：检查 commanded_pose 与实际位姿的差距
-                # actual_pose 已从上面的缓存读取中获得
-                pos_error = np.linalg.norm(commanded_pose.translation - actual_pose.translation)
-                # 正确计算旋转误差：通过相对旋转矩阵计算最短角度差
-                rot_diff = commanded_pose.rotation @ actual_pose.rotation.T
-                rot_angle = np.arccos(np.clip((np.trace(rot_diff) - 1) / 2, -1.0, 1.0))
-                
-                if pos_error > 0.2 or rot_angle > 1.5:  # 放宽到 20cm 或 86°
-                    warning_msg = (
-                        f"commanded_pose 偏离实际位姿过大，缓慢重置到实际位姿: "
-                        f"pos_error={pos_error:.3f}m (>0.2m), "
-                        f"rot_error={np.degrees(rot_angle):.1f}° (>86°)"
-                    )
-                    logger.warning(warning_msg)
-                    # 缓慢向 actual_pose 移动，避免突然跳跃
-                    # 降低插值比例到 5%，减少扭矩突变
-                    blend_factor = 0.05
-                    prev_commanded = commanded_pose.copy()
-                    commanded_pose.translation = commanded_pose.translation * (1 - blend_factor) + actual_pose.translation * blend_factor
-                    # 旋转使用 SLERP 插值
-                    R_current = prev_commanded.rotation
-                    R_target = actual_pose.rotation
-                    R_diff = R_current.T @ R_target
-                    rotvec_diff = Rotation.from_matrix(R_diff).as_rotvec()
-                    # 只移动 5%
-                    rotvec_step = rotvec_diff * blend_factor
-                    R_step = Rotation.from_rotvec(rotvec_step)
-                    commanded_pose.rotation = R_current @ R_step
-                    
-                    start_pose = prev_commanded  # 从上一帧的commanded_pose开始
-                    goal_pose = commanded_pose   # 到平滑后的commanded_pose
-                else:
-                    # 偏差正常，正常累加 delta
-                    start_pose = commanded_pose  # 从当前commanded_pose开始
-                    commanded_pose = self._compute_target_pose(commanded_pose, action[:6])
-                    goal_pose = commanded_pose   # 到累加delta后的commanded_pose
-
-                # 更新指令位姿缓存供外部（Coordinator）读取用于前端显示
-                rot_vec = normalize_rotvec(Rotation.from_matrix(commanded_pose.rotation).as_rotvec())
-                self._commanded_pose_array = np.concatenate([commanded_pose.translation, rot_vec])
-
-                # 夹爪二值化逻辑已在 transform_action 中处理
-                gripper_target = action[6]
-                if last_gripper is None or gripper_target != last_gripper:
-                    # goto_gripper 是异步调用，不会阻塞，不需要额外锁
-                    fa.goto_gripper(gripper_target, block=False, speed=GRIPPER_SPEED)
-                    last_gripper = gripper_target
-
-            # 在 CONTROL_DT 内以 INTERP_DT 为间隔用 min_jerk 插值发送
-            ts = np.arange(INTERP_DT, CONTROL_DT + INTERP_DT * 0.5, INTERP_DT)
-            for t in ts:
-                if self._skill_stop.is_set():
-                    break
-                w = min_jerk_weight(t, CONTROL_DT)
-                interp_pose = goal_pose.interpolate_with(start_pose, 1.0 - w)
-                msg_id += 1
-                timestamp = fa.get_time() - init_time
-                traj_proto = PosePositionSensorMessage(
-                    id=msg_id,
-                    timestamp=timestamp,
-                    position=interp_pose.translation,
-                    quaternion=interp_pose.quaternion,
-                )
-                impedance_proto = CartesianImpedanceSensorMessage(
-                    id=msg_id,
-                    timestamp=timestamp,
-                    translational_stiffnesses=TRANSLATIONAL_STIFFNESS,
-                    rotational_stiffnesses=ROTATIONAL_STIFFNESS,
-                )
-                ros_msg = make_sensor_group_msg(
-                    trajectory_generator_sensor_msg=sensor_proto2ros_msg(
-                        traj_proto, SensorDataMessageType.POSE_POSITION
-                    ),
-                    feedback_controller_sensor_msg=sensor_proto2ros_msg(
-                        impedance_proto, SensorDataMessageType.CARTESIAN_IMPEDANCE
-                    ),
-                )
-                fa.publish_sensor_data(ros_msg)
-                time.sleep(INTERP_DT)
-
-        # 发送终止消息
-        timestamp = fa.get_time() - init_time
-        term_msg = ShouldTerminateSensorMessage(
-            timestamp=timestamp, should_terminate=True
-        )
-        ros_msg = make_sensor_group_msg(
-            termination_handler_sensor_msg=sensor_proto2ros_msg(
-                term_msg, SensorDataMessageType.SHOULD_TERMINATE
-            )
-        )
-        fa.publish_sensor_data(ros_msg)
-        logger.info("dynamic skill 已终止")
+                if self._skill_thread is thread:
+                    self._skill_thread = None
 
     def enqueue_action(self, action: np.ndarray, *, transform: bool = True):
         """外部调用：将一个 action 放入队列，由 _skill_loop 消费。"""

@@ -1,4 +1,4 @@
-# openpi-client 依赖（已复制到 client/）
+# openpi-client 依赖（代码位于 src/client/）
 dm-tree>=0.1.8
 msgpack>=1.0.5
 numpy>=1.22.4,<2.0.0
@@ -13,6 +13,7 @@ tyro>=0.8.0
 opencv-python>=4.9.0
 imageio>=2.34.0
 imageio-ffmpeg>=0.4.9
+pygame>=2.5.0
 
 # 相机（D435 直连）
 pyrealsense2>=2.54.0

@@ -91,6 +91,7 @@ class Coordinator:
         self._latest_action_transformed: list | None = None
         self._latest_infer_ms: float | None = None
         self._latest_prev_total_ms: float | None = None
+        self._latest_ee_force_torque: list | None = None
         self._telemetry_lock = threading.Lock()
 
         # WebSocket 客户端集合
@@ -173,7 +174,7 @@ class Coordinator:
 
             with open(path_tele, "w") as f:
                 for entry in tele_log:
-                    f.write(json.dumps(entry, indent=2) + "\n")
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
             logger.info(f"Session saved to {session_dir}")
         except Exception as e:
@@ -191,8 +192,7 @@ class Coordinator:
     def run_control_loop(self):
         """10Hz 控制循环。"""
         dt = 1.0 / self._args.control_hz
-        self._env.start()
-        self._env.start_skill_thread()
+        self._env.start_control()
         logger.info("Control loop started (skill thread running at 10Hz)")
 
         last_state = State.IDLE
@@ -201,11 +201,7 @@ class Coordinator:
             with self._state_lock:
                 current_state = self._state
 
-            # 自动录制逻辑：进入 RUNNING 开始，退出 RUNNING 停止
-            if current_state == State.RUNNING and last_state != State.RUNNING:
-                self._start_session_logging()
-            elif current_state != State.RUNNING and last_state == State.RUNNING:
-                self._stop_session_logging()
+            self._sync_recording_state(current_state, last_state)
             last_state = current_state
 
             try:
@@ -220,88 +216,123 @@ class Coordinator:
             else:
                 logger.warning(f"Control loop overran by {-sleep_time*1000:.1f}ms")
 
-    def _step(self):
-        current_state = self.state
+    def _sync_recording_state(self, current_state: State, last_state: State):
+        if current_state == State.RUNNING and last_state != State.RUNNING:
+            self._start_session_logging()
+        elif current_state != State.RUNNING and last_state == State.RUNNING:
+            self._stop_session_logging()
 
-        with self._prompt_lock:
-            prompt = self._prompt
-
-        # 采集 obs（含原始帧）
+    def _capture_observation(self, prompt: str):
         obs, img1_raw, img2_raw = self._env.get_observation(prompt)
-
-        # 更新最新帧
         with self._frame_lock:
             self._latest_img1 = img1_raw
             self._latest_img2 = img2_raw
+        return obs, img1_raw, img2_raw
 
-        # 缓存最新 state
+    def _update_latest_telemetry(self, obs: dict):
         with self._telemetry_lock:
             self._latest_state = obs["observation/state"].tolist()
             self._latest_joints = obs.get("observation/joints", np.zeros(7)).tolist()
             self._latest_target_pose = self._env.commanded_pose_array.tolist()
             self._latest_ee_force_torque = self._env.ee_force_torque.tolist()
 
-        # 录屏：分别保存双路图像帧
+    def _record_frames(self, img1_raw: np.ndarray, img2_raw: np.ndarray):
         with self._record_lock:
             if self._recording and img1_raw is not None and img2_raw is not None:
                 self._record_frames1.append(img1_raw.copy())
                 self._record_frames2.append(img2_raw.copy())
 
-        if current_state == State.RUNNING:
-            # action_plan 耗尽时推理
-            if not self._action_plan:
-                if self._client is None:
-                    logger.warning("推理服务不可用，跳过推理")
-                    with self._state_lock:
-                        self._state = State.IDLE
-                    return
-                t0 = time.time()
-                result = self._client.infer(obs)
-                prev_total_ms = (time.time() - t0) * 1000
-                action_chunk = result["actions"]
-                timing = result.get("server_timing", {})
-                infer_ms = timing.get("infer_ms", None)
-                with self._telemetry_lock:
-                    self._latest_infer_ms = infer_ms
-                    self._latest_prev_total_ms = prev_total_ms
-                self._action_plan.extend(action_chunk[:self._args.replan_steps])
-
-            action = self._action_plan.popleft()  # (7,)
-            self._env.enqueue_action(action)
-
-            # 使用统一的变换逻辑
-            ta = transform_action(action)
-
-            with self._telemetry_lock:
-                self._latest_action = action.tolist()
-                self._latest_action_transformed = ta.tolist()
-
-            # 每次执行动作步都记录遥测日志，时间戳为相对于视频开始的时间
-            with self._record_lock:
-                if self._recording:
-                    # 计算相对于录制开始的时间戳（从0开始）
-                    relative_time = time.time() - self._record_start_time
-                    entry = {
-                        "timestamp": round(relative_time, 3),
-                        "state": self._state.value,
-                        "observation_state": self._latest_state,
-                        "observation_joints": self._latest_joints,
-                        "commanded_target_pose": self._latest_target_pose,
-                        "ee_force_torque": self._latest_ee_force_torque,
-                        "action_raw": self._latest_action,
-                        "action_transformed": self._latest_action_transformed,
-                        "inference_time_ms": self._latest_infer_ms,
-                        "total_time_ms": self._latest_prev_total_ms,
-                    }
-                    self._telemetry_log.append(entry)
-
-        elif current_state == State.HOMING:
-            self._env._stop_skill_thread()
-            self._env.reset_to_home()
-            self._env.start_skill_thread()
+    def _infer_action_plan_if_needed(self, obs: dict):
+        if self._action_plan:
+            return
+        if self._client is None:
+            logger.warning("推理服务不可用，跳过推理")
             with self._state_lock:
                 self._state = State.IDLE
-            logger.info("Homing complete, State -> IDLE")
+            return
+
+        t0 = time.time()
+        result = self._client.infer(obs)
+        prev_total_ms = (time.time() - t0) * 1000
+        action_chunk = result["actions"]
+        timing = result.get("server_timing", {})
+        infer_ms = timing.get("infer_ms", None)
+        with self._telemetry_lock:
+            self._latest_infer_ms = infer_ms
+            self._latest_prev_total_ms = prev_total_ms
+        self._action_plan.extend(action_chunk[:self._args.replan_steps])
+
+    def _record_action_telemetry(self):
+        with self._record_lock:
+            if self._recording:
+                relative_time = time.time() - self._record_start_time
+                entry = {
+                    "timestamp": round(relative_time, 3),
+                    "state": self._state.value,
+                    "observation_state": self._latest_state,
+                    "observation_joints": self._latest_joints,
+                    "commanded_target_pose": self._latest_target_pose,
+                    "ee_force_torque": self._latest_ee_force_torque,
+                    "action_raw": self._latest_action,
+                    "action_transformed": self._latest_action_transformed,
+                    "inference_time_ms": self._latest_infer_ms,
+                    "total_time_ms": self._latest_prev_total_ms,
+                }
+                self._telemetry_log.append(entry)
+
+    def _run_action_step(self, obs: dict):
+        self._infer_action_plan_if_needed(obs)
+        if not self._action_plan:
+            return
+
+        action = self._action_plan.popleft()
+        self._env.enqueue_action(action)
+        ta = transform_action(action)
+
+        with self._telemetry_lock:
+            self._latest_action = action.tolist()
+            self._latest_action_transformed = ta.tolist()
+
+        self._record_action_telemetry()
+
+    def _handle_homing(self):
+        self._env.home_and_restart()
+        with self._state_lock:
+            self._state = State.IDLE
+        logger.info("Homing complete, State -> IDLE")
+
+    def _build_stream_payload(self, img1_b64: str, img2_b64: str) -> str:
+        payload = {
+            "state": self._state.value,
+            "img1": img1_b64,
+            "img2": img2_b64,
+            "latest_state": self._latest_state,
+            "latest_joints": self._latest_joints,
+            "latest_target_pose": self._latest_target_pose,
+            "latest_action": self._latest_action,
+            "latest_action_transformed": self._latest_action_transformed,
+            "infer_ms": self._latest_infer_ms,
+            "prev_total_ms": self._latest_prev_total_ms,
+            "robot_connected": not self._args.no_robot,
+            "server_connected": self._client is not None,
+        }
+        return json.dumps(payload)
+
+    def _step(self):
+        current_state = self.state
+
+        with self._prompt_lock:
+            prompt = self._prompt
+
+        obs, img1_raw, img2_raw = self._capture_observation(prompt)
+        self._update_latest_telemetry(obs)
+        self._record_frames(img1_raw, img2_raw)
+
+        if current_state == State.RUNNING:
+            self._run_action_step(obs)
+
+        elif current_state == State.HOMING:
+            self._handle_homing()
 
         else:  # IDLE
             self._env.hold_pose()
@@ -325,21 +356,7 @@ class Coordinator:
             img1_b64 = _encode_jpeg_b64(img1)
             img2_b64 = _encode_jpeg_b64(img2)
 
-            payload = {
-                "state": self._state.value,
-                "img1": img1_b64,
-                "img2": img2_b64,
-                "latest_state": self._latest_state,
-                "latest_joints": self._latest_joints,
-                "latest_target_pose": self._latest_target_pose,
-                "latest_action": self._latest_action,
-                "latest_action_transformed": self._latest_action_transformed,
-                "infer_ms": self._latest_infer_ms,
-                "prev_total_ms": self._latest_prev_total_ms,
-                "robot_connected": not self._args.no_robot,
-                "server_connected": self._client is not None
-            }
-            msg = json.dumps(payload)
+            msg = self._build_stream_payload(img1_b64, img2_b64)
 
             async with self._ws_lock:
                 dead = set()

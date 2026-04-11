@@ -7,7 +7,7 @@ Franka Panda 数据采集框架
 依赖 key_control.py 提供 state/action 数据源。
 
 命令行参数：
-    --collection_dir  数据根目录 (默认: ~/franka_data/collected)
+    --collection_dir  数据根目录 (默认: 仓库根目录/collected)
     --task_name       任务子目录名   (默认: default)
     --collect_hz      采集频率 Hz     (默认: 10)
     --max_frames      每段轨迹最大帧数 (默认: 1000)
@@ -130,6 +130,10 @@ class DataRecorder:
     MAX_FRAMES = 1000
     ACTION_THRESH_POS = 0.0005    # m
     ACTION_THRESH_ROT = 0.005    # rad
+    STATE_THRESH_POS = 0.0005    # m
+    STATE_THRESH_ROT = 0.005     # rad
+    STATE_THRESH_GRIPPER = 0.0005  # m
+    TRAILING_REPEAT_FRAMES = 10
 
     def __init__(
         self,
@@ -181,13 +185,14 @@ class DataRecorder:
 
         self.running = True
         self._exited = False  # 防止 _on_exit 被多次调用
+        self._last_recorded_state: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # 录制控制
     # ------------------------------------------------------------------
 
     def start_recording(self):
-        """外部绑定到按键 1"""
+        """开始录制当前轨迹。"""
         if self.is_recording:
             print("  [录制] 已在录制中")
             return
@@ -196,10 +201,11 @@ class DataRecorder:
             self.recording_frames1.clear()
             self.recording_frames2.clear()
             self.recording_data.clear()
+            self._last_recorded_state = None
         print("  [录制] 开始 → 按 2 结束当前轨迹")
 
     def stop_recording(self):
-        """外部绑定到按键 2"""
+        """结束并保存当前轨迹。"""
         if not self.is_recording:
             print("  [录制] 当前没有在录制")
             return
@@ -215,6 +221,22 @@ class DataRecorder:
 
     def _save_trajectory(self, frames1, frames2, data):
         """将一段轨迹写入磁盘"""
+        if frames1 and data:
+            last_state = np.asarray(data[-1]["state"], dtype=np.float64)
+            last_action = np.asarray(data[-1]["action"], dtype=np.float64)
+            padded_action = np.zeros_like(last_action)
+            padded_action[6] = last_action[6]
+
+            last_frame1 = frames1[-1]
+            last_frame2 = frames2[-1]
+            for _ in range(self.TRAILING_REPEAT_FRAMES):
+                frames1.append(last_frame1.copy())
+                frames2.append(last_frame2.copy())
+                data.append({
+                    "state": last_state.tolist(),
+                    "action": padded_action.tolist(),
+                })
+
         task_dir = self.collection_dir / self.task_name
         task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -273,20 +295,41 @@ class DataRecorder:
             and (np.abs(rot) < self.action_thresh_rot).all()
         )
 
+    def _is_state_same_as_last_recorded(self, state: np.ndarray) -> bool:
+        """判断当前 state 是否与上一条已录制 state 基本一致。"""
+        if self._last_recorded_state is None:
+            return False
+
+        pos_same = np.all(
+            np.abs(state[:3] - self._last_recorded_state[:3]) < self.STATE_THRESH_POS
+        )
+        rot_same = np.all(
+            np.abs(state[3:6] - self._last_recorded_state[3:6]) < self.STATE_THRESH_ROT
+        )
+        gripper_same = np.all(
+            np.abs(state[6:8] - self._last_recorded_state[6:8]) < self.STATE_THRESH_GRIPPER
+        )
+        return pos_same and rot_same and gripper_same
+
     # ------------------------------------------------------------------
-    # 采集循环（在主线程运行）
+    # 采集循环（在独立线程运行）
     # ------------------------------------------------------------------
 
     def run(self):
         """主采集循环，在独立线程运行。"""
         self.running = True
+        control_hint = (
+            "  1: 开始录制   2: 结束录制   ESC: 退出"
+            if self.kc.input_device == "keyboard"
+            else "  L3: 开始录制   R3: 结束录制   PS: 退出"
+        )
 
         print("\n" + "=" * 60)
         print("  数据录制器已启动")
         print(f"  保存路径: {self.collection_dir / self.task_name}")
         print(f"  采集频率: {self.collect_hz}Hz  每段最大帧: {self.max_frames}")
         print("=" * 60)
-        print("  1: 开始录制   2: 结束录制   ESC: 退出")
+        print(control_hint)
         print("=" * 60 + "\n")
 
         last_t = time.time()
@@ -308,7 +351,7 @@ class DataRecorder:
     def _collect_frame(self):
         state, action = self.kc.get_state_and_action()
 
-        if self._is_action_empty(action):
+        if self._is_action_empty(action) and self._is_state_same_as_last_recorded(state):
             self.stats["skipped_frames"] += 1
             return
 
@@ -322,6 +365,7 @@ class DataRecorder:
             self.recording_frames1.append(img1.copy())
             self.recording_frames2.append(img2.copy())
             self.recording_data.append({"state": state.tolist(), "action": action.tolist()})
+            self._last_recorded_state = np.asarray(state, dtype=np.float64).copy()
 
             if len(self.recording_frames1) >= self.max_frames:
                 print(f"  [录制] 达到最大帧数 {self.max_frames}，自动结束")
@@ -370,11 +414,26 @@ def main():
     parser.add_argument("--task_name", default=None)
     parser.add_argument("--collect_hz", type=float, default=None)
     parser.add_argument("--max_frames", type=int, default=None)
+    parser.add_argument(
+        "--input_device",
+        choices=("keyboard", "ps4"),
+        default="keyboard",
+        help="控制输入设备，默认 keyboard，可选 ps4。",
+    )
+    parser.add_argument(
+        "--joystick_index",
+        type=int,
+        default=0,
+        help="PS4 手柄索引，默认 0。",
+    )
     args = parser.parse_args()
 
     from key_control import KeyboardController
-    print("[DEBUG] 创建 KeyboardController...")
-    kc = KeyboardController()
+    print(f"[DEBUG] 创建控制器... input_device={args.input_device}")
+    kc = KeyboardController(
+        input_device=args.input_device,
+        joystick_index=args.joystick_index,
+    )
     print("[DEBUG] 启动控制线程...")
     kc.start()
     time.sleep(0.5)
@@ -389,31 +448,41 @@ def main():
         max_frames=args.max_frames,
     )
 
-    _orig_on_press = kc._on_key_press
-
-    def wrapped_on_press(key):
-        try:
-            char = key.char.lower()
-        except AttributeError:
-            char = key.name.lower()
-        if char == '1':
-            recorder.start_recording()
-            return
-        if char == '2':
-            recorder.stop_recording()
-            return
-        _orig_on_press(key)
-
     # 采集循环独立线程
     rec_thread = threading.Thread(target=recorder.run, daemon=True)
     rec_thread.start()
 
-    print("[DEBUG] 启动键盘监听...")
-    with keyboard.Listener(
-        on_press=wrapped_on_press,
-        on_release=kc._on_key_release,
-    ) as listener:
-        listener.join()
+    if args.input_device == "keyboard":
+        _orig_on_press = kc._on_key_press
+
+        def wrapped_on_press(key):
+            try:
+                char = key.char.lower()
+            except AttributeError:
+                char = key.name.lower()
+            if char == '1':
+                recorder.start_recording()
+                return
+            if char == '2':
+                recorder.stop_recording()
+                return
+            _orig_on_press(key)
+
+        print("[DEBUG] 启动键盘监听...")
+        with keyboard.Listener(
+            on_press=wrapped_on_press,
+            on_release=kc._on_key_release,
+        ) as listener:
+            listener.join()
+    else:
+        kc.bind_event("record_start", recorder.start_recording)
+        kc.bind_event("record_stop", recorder.stop_recording)
+        print("[DEBUG] PS4 手柄模式运行中...")
+        try:
+            while kc.running:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            kc.stop()
 
     kc.stop()
     recorder._on_exit()

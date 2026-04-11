@@ -5,8 +5,8 @@ Franka Panda 键盘遥操作控制器
 提供：
   - 双频率控制循环：
     * 10Hz 输入采样：读取按键并计算 action 增量
-    * 100Hz 发布循环：对 action 增量线性插值，平滑发布目标位姿
-  - 按键 → 位姿增量的映射（末端坐标系旋转，世界坐标系位置）
+    * 50Hz 发布循环：对 action 增量做 min-jerk 插值，平滑发布目标位姿
+  - 按键 → 位姿增量的映射（位置与旋转都在基座坐标系表达）
   - 命令位姿追踪（commanded_pose / prev_commanded_pose）
 
 本文件不涉及录制逻辑，供 data_recorder.py 等模块引用。
@@ -14,6 +14,7 @@ Franka Panda 键盘遥操作控制器
 
 import logging
 import math
+import os
 import threading
 import time
 
@@ -32,6 +33,12 @@ from frankapy.proto import (
     CartesianImpedanceSensorMessage,
 )
 
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+try:
+    import pygame
+except ModuleNotFoundError:
+    pygame = None
+
 
 # ==================================================================
 # 控制参数
@@ -48,6 +55,26 @@ DEFAULT_ROT_STIFF = FC.DEFAULT_ROTATIONAL_STIFFNESSES
 
 MAX_DELTA_POS = MAX_LIN_VEL * INPUT_DT     # 0.01 m
 MAX_DELTA_ROT = MAX_ROT_VEL * INPUT_DT     # ≈ 0.0785 rad
+JOYSTICK_DEADZONE = 0.12
+
+PS4_AXIS_LEFT_X = 0
+PS4_AXIS_LEFT_Y = 1
+PS4_AXIS_L2 = 2
+PS4_AXIS_RIGHT_X = 3
+PS4_AXIS_RIGHT_Y = 4
+PS4_AXIS_R2 = 5
+
+PS4_BUTTON_SQUARE = 0
+PS4_BUTTON_CROSS = 1
+PS4_BUTTON_CIRCLE = 2
+PS4_BUTTON_TRIANGLE = 3
+PS4_BUTTON_L1 = 4
+PS4_BUTTON_R1 = 5
+PS4_BUTTON_SHARE = 8
+PS4_BUTTON_OPTIONS = 9
+PS4_BUTTON_L3 = 10
+PS4_BUTTON_R3 = 11
+PS4_BUTTON_PS = 12
 
 
 # ==================================================================
@@ -69,13 +96,18 @@ class KeyboardController:
         commanded_pose      RigidTransform  当前目标位姿
         prev_commanded_pose RigidTransform 上一拍目标位姿（用于计算 action）
         gripper_target     float          夹爪目标宽度 (m)
-        step_size          float          速度倍率 [0.1, 1.0]
+        step_size          float          当前速度倍率，取值来自 [0.4, 0.7, 1.0]
         running            bool           程序是否在运行
     """
 
-    def __init__(self):
+    def __init__(self, input_device: str = "keyboard", joystick_index: int = 0):
+        if input_device not in ("keyboard", "ps4"):
+            raise ValueError(f"不支持的输入设备: {input_device}")
+
         self.fa = FrankaArm(with_gripper=True)
         self.fa.reset_joints()
+        self.input_device = input_device
+        self.joystick_index = joystick_index
 
         self.gripper_target = 0.04   # 默认半开
         self.step_size = 0.7          # 速度倍率：3档 [0.4, 0.7, 1.0]
@@ -101,6 +133,16 @@ class KeyboardController:
         # 状态缓存
         self._cached_gripper_width = self.fa.get_gripper_width()
 
+        # 手柄事件
+        self._event_callbacks: dict[str, callable] = {}
+        self._pygame_ready = False
+        self._joystick = None
+        self._prev_buttons: dict[int, bool] = {}
+        self._prev_hat = (0, 0)
+
+        if self.input_device == "ps4":
+            self._init_ps4()
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
@@ -108,20 +150,32 @@ class KeyboardController:
     def start(self):
         """启动控制线程（daemon），不阻塞。"""
         # 直接调用复位操作来初始化
+        self._print_controls()
         self._reset()
 
     def stop(self):
         """停止控制线程，等待其退出。"""
         self.running = False
         self._stop_event.set()
-        if self._pub_thread and self._pub_thread.is_alive():
+        if (
+            self._pub_thread
+            and self._pub_thread.is_alive()
+            and threading.current_thread() is not self._pub_thread
+        ):
             self._pub_thread.join(timeout=2.0)
+        self._shutdown_ps4()
+
+    def bind_event(self, event_name: str, callback):
+        """绑定离散事件回调，例如 record_start / record_stop。"""
+        self._event_callbacks[event_name] = callback
 
     # ------------------------------------------------------------------
     # 键盘回调（供外部 Listener 注入）
     # ------------------------------------------------------------------
 
     def _on_key_press(self, key):
+        if self.input_device != "keyboard":
+            return
         try:
             char = key.char.lower()
         except AttributeError:
@@ -158,12 +212,167 @@ class KeyboardController:
             self.keys_pressed.add(char)
 
     def _on_key_release(self, key):
+        if self.input_device != "keyboard":
+            return
         try:
             char = key.char.lower()
         except AttributeError:
             char = key.name.lower()
         with self._keys_lock:
             self.keys_pressed.discard(char)
+
+    def _init_ps4(self):
+        if pygame is None:
+            raise ModuleNotFoundError(
+                "PS4 手柄模式需要安装 pygame，请先执行 `pip install pygame`。"
+            )
+
+        pygame.init()
+        pygame.joystick.init()
+        count = pygame.joystick.get_count()
+        if count <= self.joystick_index:
+            raise RuntimeError(
+                f"未找到索尼 PS4 手柄。当前检测到 {count} 个手柄，"
+                f"但请求使用索引 {self.joystick_index}。"
+            )
+
+        self._joystick = pygame.joystick.Joystick(self.joystick_index)
+        self._joystick.init()
+        self._pygame_ready = True
+        self._prev_hat = (0, 0)
+        self._prev_buttons = {
+            idx: bool(self._joystick.get_button(idx))
+            for idx in range(self._joystick.get_numbuttons())
+        }
+
+        print(f"  [手柄] 已连接: {self._joystick.get_name()} (index={self.joystick_index})")
+
+    def _shutdown_ps4(self):
+        if not self._pygame_ready or pygame is None:
+            return
+
+        if self._joystick is not None and self._joystick.get_init():
+            self._joystick.quit()
+        pygame.joystick.quit()
+        pygame.quit()
+        self._pygame_ready = False
+
+    def _print_controls(self):
+        if self.input_device == "keyboard":
+            print("  [控制] 键盘模式")
+            print("  [控制] W/S:X  A/D:Y  I/K:Z  Q/E:Roll  U/O:Pitch  J/L:Yaw")
+            print("  [控制] G/H/F:夹爪  +/-:速度档位  R:复位  1/2:开始/结束录制  ESC:退出")
+            return
+
+        print("  [控制] PS4 手柄模式")
+        print("  [控制] 左摇杆:X/Y平移  右摇杆:Z平移/Yaw  L1/R1:Roll  L2/R2:Pitch")
+        print("  [控制] 方块/圆圈/三角:关闭/打开/半开夹爪  十字键左右:速度档位")
+        print("  [控制] L3/R3:开始/结束录制  OPTIONS:复位  PS:退出")
+
+    def _emit_event(self, event_name: str):
+        callback = self._event_callbacks.get(event_name)
+        if callback is not None:
+            callback()
+
+    def _apply_deadzone(self, value: float) -> float:
+        return 0.0 if abs(value) < JOYSTICK_DEADZONE else float(value)
+
+    def _read_axis(self, axis_index: int) -> float:
+        if self._joystick is None or axis_index >= self._joystick.get_numaxes():
+            return 0.0
+        return self._apply_deadzone(self._joystick.get_axis(axis_index))
+
+    def _read_trigger(self, axis_index: int, fallback_button: int | None = None) -> float:
+        if self._joystick is not None and axis_index < self._joystick.get_numaxes():
+            raw = self._joystick.get_axis(axis_index)
+            normalized = (raw + 1.0) / 2.0
+            if normalized < JOYSTICK_DEADZONE:
+                return 0.0
+            return float(np.clip(normalized, 0.0, 1.0))
+
+        if fallback_button is not None and self._joystick is not None:
+            if fallback_button < self._joystick.get_numbuttons():
+                return float(self._joystick.get_button(fallback_button))
+        return 0.0
+
+    def _handle_ps4_buttons(self):
+        if self._joystick is None:
+            return
+
+        for button_idx in range(self._joystick.get_numbuttons()):
+            pressed = bool(self._joystick.get_button(button_idx))
+            prev_pressed = self._prev_buttons.get(button_idx, False)
+            if pressed and not prev_pressed:
+                if button_idx == PS4_BUTTON_PS:
+                    self.stop()
+                    return
+                if button_idx == PS4_BUTTON_OPTIONS:
+                    self._reset()
+                    return
+                if button_idx == PS4_BUTTON_L3:
+                    self._emit_event("record_start")
+                elif button_idx == PS4_BUTTON_R3:
+                    self._emit_event("record_stop")
+                elif button_idx == PS4_BUTTON_SQUARE:
+                    self._close_gripper()
+                elif button_idx == PS4_BUTTON_CIRCLE:
+                    self._open_gripper()
+                elif button_idx == PS4_BUTTON_TRIANGLE:
+                    self._half_gripper()
+            self._prev_buttons[button_idx] = pressed
+
+        hat = self._joystick.get_hat(0) if self._joystick.get_numhats() > 0 else (0, 0)
+        prev_hat_x, _ = self._prev_hat
+        hat_x, _ = hat
+        if hat_x == 1 and prev_hat_x != 1:
+            self._speed_index = min(len(self._speed_levels) - 1, self._speed_index + 1)
+            self.step_size = self._speed_levels[self._speed_index]
+            print(f"  [速度] 倍率: {self.step_size*100:.0f}%")
+        elif hat_x == -1 and prev_hat_x != -1:
+            self._speed_index = max(0, self._speed_index - 1)
+            self.step_size = self._speed_levels[self._speed_index]
+            print(f"  [速度] 倍率: {self.step_size*100:.0f}%")
+        self._prev_hat = hat
+
+    def _get_keyboard_delta(self) -> tuple[float, float, float, float, float, float]:
+        with self._keys_lock:
+            keys = set(self.keys_pressed)
+
+        speed = self.step_size
+        dx = (int('s' in keys) - int('w' in keys)) * MAX_DELTA_POS * speed
+        dy = (int('d' in keys) - int('a' in keys)) * MAX_DELTA_POS * speed
+        dz = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_POS * speed
+        droll = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_ROT * speed
+        dpitch = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
+        dyaw = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
+        return dx, dy, dz, droll, dpitch, dyaw
+
+    def _get_ps4_delta(self) -> tuple[float, float, float, float, float, float]:
+        pygame.event.pump()
+        self._handle_ps4_buttons()
+        speed = self.step_size
+
+        left_x = self._read_axis(PS4_AXIS_LEFT_X)
+        left_y = self._read_axis(PS4_AXIS_LEFT_Y)
+        right_x = self._read_axis(PS4_AXIS_RIGHT_X)
+        right_y = self._read_axis(PS4_AXIS_RIGHT_Y)
+        l2 = self._read_trigger(PS4_AXIS_L2, fallback_button=6)
+        r2 = self._read_trigger(PS4_AXIS_R2, fallback_button=7)
+        l1 = float(self._joystick.get_button(PS4_BUTTON_L1))
+        r1 = float(self._joystick.get_button(PS4_BUTTON_R1))
+
+        dx = left_y * MAX_DELTA_POS * speed
+        dy = left_x * MAX_DELTA_POS * speed
+        dz = -right_y * MAX_DELTA_POS * speed
+        droll = (l1 - r1) * MAX_DELTA_ROT * speed
+        dpitch = (l2 - r2) * MAX_DELTA_ROT * speed
+        dyaw = right_x * MAX_DELTA_ROT * speed
+        return dx, dy, dz, droll, dpitch, dyaw
+
+    def _get_input_delta(self) -> tuple[float, float, float, float, float, float]:
+        if self.input_device == "ps4":
+            return self._get_ps4_delta()
+        return self._get_keyboard_delta()
 
     # ------------------------------------------------------------------
     # 控制线程
@@ -205,17 +414,7 @@ class KeyboardController:
 
             if current_time - last_input_time >= INPUT_DT:
                 last_input_time = current_time
-
-                with self._keys_lock:
-                    keys = set(self.keys_pressed)
-                speed = self.step_size
-
-                dx = (int('s' in keys) - int('w' in keys)) * MAX_DELTA_POS * speed
-                dy = (int('d' in keys) - int('a' in keys)) * MAX_DELTA_POS * speed
-                dz = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_POS * speed
-                droll  = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_ROT * speed
-                dpitch = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
-                dyaw   = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
+                dx, dy, dz, droll, dpitch, dyaw = self._get_input_delta()
 
                 moved = dx or dy or dz or droll or dpitch or dyaw
 
@@ -331,8 +530,14 @@ class KeyboardController:
             time.sleep(0.5)
             
             # 等待 publish_loop 线程退出
-            if self._pub_thread is not None and self._pub_thread.is_alive():
+            if (
+                self._pub_thread is not None
+                and self._pub_thread.is_alive()
+                and threading.current_thread() is not self._pub_thread
+            ):
                 self._pub_thread.join(timeout=2.0)
+                self._pub_thread = None
+            elif threading.current_thread() is self._pub_thread:
                 self._pub_thread = None
             
             # 3. 回到 home 位姿

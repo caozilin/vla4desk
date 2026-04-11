@@ -2,327 +2,477 @@
 
 ## 概述
 
-数据采集模块 (`data_collection`) 用于录制键盘遥操作过程中的状态-动作对，生成可用于训练 VLA (Vision-Language-Action) 模型的数据集。
+`src/data_collection` 负责录制 Franka 遥操作数据，输出双路视频和状态-动作对，供后续 VLA 训练使用。
 
-**关键设计目标**：与 `vla_control` 模块的 action 格式完全一致，确保采集的数据可以直接用于训练，且训练出的模型可以直接部署。
+当前实现包含两部分：
+
+- `key_control.py`
+  负责遥操作控制，支持 `keyboard` 和 `ps4` 两种输入设备。
+- `data_recorder.py`
+  负责双路 D435 取流、空动作过滤、episode 保存。
+
+设计目标不是“录键盘”，而是生成和 `src/vla_control/franka_env.py` 执行侧兼容的 `state/action` 数据格式。
 
 ---
 
-## Action 格式规范
+## 模块关系
 
-### 整体结构
+启动链路：
 
-```python
-action: np.ndarray  # shape: (7,)
-# [delta_pos(3), delta_axisangle(3), gripper_cmd(1)]
+```text
+start_data_collector.sh
+  -> python data_recorder.py
+      -> KeyboardController(input_device=...)
+      -> DataRecorder(...)
 ```
 
-- **`action[0:3]`**: 位置增量 `[dx, dy, dz]`（米），**基座坐标系**
-- **`action[3:6]`**: 旋转增量 `[droll, dpitch, dyaw]`（弧度），**轴角表示，基座坐标系**
-- **`action[6]`**: 夹爪控制信号（意图信号，非物理值）
+运行期职责：
+
+- `KeyboardController`
+  - 初始化 `FrankaArm(with_gripper=True)`
+  - 维护 `commanded_pose / prev_commanded_pose / gripper_target`
+  - 以 10Hz 采样输入
+  - 以 50Hz 发布平滑插值后的 dynamic pose 指令
+- `DataRecorder`
+  - 以 10Hz 采样 `state/action`
+  - 过滤空动作
+  - 在录制开启时缓存图像和数据
+  - 保存为 `cam1.mp4`、`cam2.mp4`、`data.csv`
 
 ---
 
-## 夹爪信号映射
+## 输入设备
 
-### 采集时 (key_control.py)
+### 默认行为
+
+默认输入设备是键盘：
+
+```bash
+./start_data_collector.sh
+```
+
+也可以显式指定：
+
+```bash
+./start_data_collector.sh --input_device keyboard
+./start_data_collector.sh --input_device ps4
+./start_data_collector.sh --input_device ps4 --joystick_index 0
+```
+
+对应参数来自 `data_recorder.py`：
+
+- `--input_device {keyboard,ps4}`
+- `--joystick_index <int>`
+
+### 键盘映射
+
+代码里的控制对如下：
+
+- 平移：`W/S`、`A/D`、`I/K`
+- 旋转：`Q/E`、`U/O`、`J/L`
+- 夹爪：`G` 关闭，`H` 打开，`F` 半开
+- 速度档位：`+` / `-`
+- 复位：`R`
+- 录制：`1` 开始，`2` 结束
+- 退出：`ESC`
+
+实际增量由下面的代码决定：
+
+```python
+dx = (int('s' in keys) - int('w' in keys)) * MAX_DELTA_POS * speed
+dy = (int('d' in keys) - int('a' in keys)) * MAX_DELTA_POS * speed
+dz = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_POS * speed
+
+droll = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_ROT * speed
+dpitch = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
+dyaw = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
+```
+
+如果你关心正负方向，以这段代码为准，不要以旧文档或口头描述为准。
+
+### PS4 二代手柄映射
+
+当前 `pygame` 映射如下：
+
+- 左摇杆：`X/Y` 平移
+- 右摇杆：`Z` 平移和 `Yaw`
+- `L1/R1`：`Roll`
+- `L2/R2`：`Pitch`
+- `方块`：关闭夹爪
+- `圆圈`：打开夹爪
+- `三角`：半开夹爪
+- 十字键左右：速度档位减/加
+- `OPTIONS`：复位
+- `L3`：开始录制
+- `R3`：结束录制
+- `PS`：退出
+
+代码里使用的轴/按钮编号：
+
+```python
+PS4_AXIS_LEFT_X = 0
+PS4_AXIS_LEFT_Y = 1
+PS4_AXIS_L2 = 2
+PS4_AXIS_RIGHT_X = 3
+PS4_AXIS_RIGHT_Y = 4
+PS4_AXIS_R2 = 5
+
+PS4_BUTTON_SQUARE = 0
+PS4_BUTTON_CIRCLE = 2
+PS4_BUTTON_TRIANGLE = 3
+PS4_BUTTON_L1 = 4
+PS4_BUTTON_R1 = 5
+PS4_BUTTON_OPTIONS = 9
+PS4_BUTTON_L3 = 10
+PS4_BUTTON_R3 = 11
+PS4_BUTTON_PS = 12
+```
+
+不同系统的 SDL 映射可能略有差异。如果实机按键不对，优先修改 `key_control.py` 顶部这些常量。
+
+---
+
+## 控制频率与速度
+
+`key_control.py` 中的关键参数：
+
+```python
+INPUT_DT = 0.1
+PUBLISH_DT = 0.02
+MAX_LIN_VEL = 0.1
+MAX_ROT_VEL = math.pi / 4
+GRIPPER_SPEED = 0.08
+```
+
+含义：
+
+- 输入采样频率：10Hz
+- 控制发布频率：50Hz
+- 最大线速度：`0.1 m/s`
+- 最大角速度：`pi/4 rad/s`
+- 夹爪速度：`0.08 m/s`
+
+单次输入采样对应的最大增量：
+
+```python
+MAX_DELTA_POS = MAX_LIN_VEL * INPUT_DT   # 0.01 m
+MAX_DELTA_ROT = MAX_ROT_VEL * INPUT_DT   # 0.0785 rad
+```
+
+速度倍率共三档：
+
+```python
+_speed_levels = [0.4, 0.7, 1.0]
+```
+
+默认是 `0.7` 档。
+
+键盘和 PS4 共用同一套：
+
+- `MAX_LIN_VEL`
+- `MAX_ROT_VEL`
+- `_speed_levels`
+
+也就是说，手柄不是另一套速度体系，只是另一种输入源。
+
+---
+
+## State 与 Action 格式
+
+### State
+
+`get_state_and_action()` 返回的 `state` 为 `(8,)`：
+
+```python
+state = [pos(3), rotvec(3), finger1(1), finger2(1)]
+```
+
+具体含义：
+
+- `state[0:3]`
+  末端位置 `translation`
+- `state[3:6]`
+  末端姿态的旋转向量 `Rotation.from_matrix(...).as_rotvec()`
+- `state[6]`
+  当前夹爪宽度的一半
+- `state[7]`
+  当前夹爪宽度负的一半
+
+代码实现：
+
+```python
+half = self._cached_gripper_width / 2.0
+state = np.concatenate([pos, rotvec, [half], [-half]])
+```
+
+### Action
+
+`action` 为 `(7,)`：
+
+```python
+action = [delta_pos(3), delta_axisangle(3), gripper_cmd(1)]
+```
+
+具体来源：
+
+- `action[:3]`
+  `commanded_pose.translation - prev_commanded_pose.translation`
+- `action[3:6]`
+  `commanded_pose.rotation @ prev_commanded_pose.rotation.T` 的轴角
+- `action[6]`
+  二值夹爪意图，不是物理宽度
+
+夹爪编码：
 
 ```python
 if self.gripper_target < 0.04:
-    delta[6] = 1.0   # 闭合意图
+    delta[6] = 1.0
 else:
-    delta[6] = -1.0  # 打开意图
+    delta[6] = -1.0
 ```
 
-- **`gripper_target < 0.04`**（如 0.0 闭合）→ 输出 `1.0`（正数）
-- **`gripper_target >= 0.04`**（如 0.04 半开、0.08 全开）→ 输出 `-1.0`（负数）
+因此：
 
-### 执行时 (vla_control/transform_action)
+- `1.0` 表示闭合意图
+- `-1.0` 表示打开意图
 
-```python
-ta[6] = 0.0 if ta[6] >= 0 else 0.08
-```
-
-- **`action[6] >= 0`** → 映射为 `0.0`（闭合，开口 0m）
-- **`action[6] < 0`** → 映射为 `0.08`（打开，开口 0.08m）
-
-### 为什么这样设计？
-
-VLA 模型只需学习**符号信号**（正/负），不需要输出精确的物理值。这样简化了模型的学习任务，同时保证了控制的鲁棒性。
+半开 `0.04m` 也会被编码为“打开意图”。
 
 ---
 
-## 旋转坐标系与轴定义
+## 执行侧对齐
 
-### 坐标系：**基座坐标系（Base Frame / World Frame）**
-
-旋转增量在基座坐标系中表达，使用**左乘**方式叠加：
+执行侧在 `src/vla_control/franka_env.py` 中使用：
 
 ```python
-delta_rot = Rotation.from_rotvec(delta_axisangle).as_matrix()
-target.rotation = delta_rot @ current.rotation  # 左乘
-```
-
-### 旋转轴与按键映射
-
-| 轴 | 按键（正向） | 按键（负向） | 变量名 | 物理含义 |
-|---|---|---|---|---|
-| **X 轴** | `u` | `o` | `droll` | 绕基座 X 轴旋转 |
-| **Y 轴** | `i` | `k` | `dpitch` | 绕基座 Y 轴旋转 |
-| **Z 轴** | `l` | `j` | `dyaw` | 绕基座 Z 轴旋转 |
-
-### 正方向定义
-
-遵循**右手螺旋定则**：
-- 右手拇指指向轴的正方向
-- 四指弯曲的方向即为旋转的正方向
-
-```python
-droll  = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
-dpitch = (int('i' in keys) - int('k' in keys)) * MAX_DELTA_ROT * speed
-dyaw   = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
-
-delta_rotvec = np.array([droll, dpitch, dyaw])
-```
-
-- 按 `u` → `droll > 0` → 绕 X 轴**正向**旋转
-- 按 `o` → `droll < 0` → 绕 X 轴**负向**旋转
-- 其他轴同理
-
----
-
-## 位置控制
-
-### 坐标系：**基座坐标系**
-
-```python
-dx = (int('w' in keys) - int('s' in keys)) * MAX_DELTA_POS * speed
-dy = (int('a' in keys) - int('d' in keys)) * MAX_DELTA_POS * speed
-dz = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_POS * speed
-```
-
-| 方向 | 按键（正向） | 按键（负向） | 坐标轴 |
-|---|---|---|---|
-| **X 方向** | `w` | `s` | 基座 X 轴 |
-| **Y 方向** | `a` | `d` | 基座 Y 轴 |
-| **Z 方向** | `q` | `e` | 基座 Z 轴 |
-
----
-
-## 完整键盘映射
-
-### 位置控制
-- `w` / `s`：沿基座 X 轴 正向/负向 移动
-- `a` / `d`：沿基座 Y 轴 正向/负向 移动
-- `q` / `e`：沿基座 Z 轴 正向/负向 移动
-
-### 旋转控制
-- `u` / `o`：绕基座 X 轴 正向/负向 旋转（roll）
-- `i` / `k`：绕基座 Y 轴 正向/负向 旋转（pitch）
-- `l` / `j`：绕基座 Z 轴 正向/负向 旋转（yaw）
-
-### 夹爪控制
-- `g`：闭合夹爪（gripper_target = 0.0）
-- `h`：打开夹爪（gripper_target = 0.08）
-- `f`：半开夹爪（gripper_target = 0.04）
-
-### 其他控制
-- `r`：复位到 home 位姿
-- `+` / `=`：增加速度倍率
-- `-` / `_`：减小速度倍率
-- `ESC`：退出程序
-
-### 录制控制
-- `1`：开始录制一段轨迹
-- `2`：结束当前轨迹（保存）
-
----
-
-## 速度配置
-
-### 三档速度控制
-
-```python
-_speed_levels = [0.4, 0.7, 1.0]  # 40%, 70%, 100%
-```
-
-- **默认档**：`0.7`（70%）
-- **最大线速度**：`0.1 m/s`
-- **最大角速度**：`π/4 rad/s`（45°/s）
-
-### 每步最大增量（20Hz 控制频率下）
-
-```python
-MAX_DELTA_POS = 0.1 * 0.05 = 0.005 m      # 5mm
-MAX_DELTA_ROT = (π/4) * 0.05 ≈ 0.039 rad  # ≈ 2.25°
-```
-
-实际增量 = 最大增量 × 速度倍率
-
----
-
-## 控制频率
-
-### key_control.py（采集端）
-- **发布频率**：`20Hz`（`PUBLISH_DT = 0.05s`）
-- **传感器消息发布**：每 50ms 发布一次 dynamic skill 控制指令
-
-### data_recorder.py（录制端）
-- **采集频率**：`10Hz`（`COLLECT_HZ = 10.0`，与 vla_control 保持一致）
-- **空动作过滤**：位置和旋转增量小于阈值时不记录
-
-```python
-ACTION_THRESH_POS = 0.0005   # 位置阈值 0.5mm
-ACTION_THRESH_ROT = 0.005    # 旋转阈值 0.005 rad ≈ 0.29°
-```
-
----
-
-## State 格式
-
-```python
-state: np.ndarray  # shape: (8,)
-# [pos(3), rotvec(3), finger1(1), finger2(1)]
-```
-
-- **`state[0:3]`**: 末端位置 `[x, y, z]`（米），基座坐标系
-- **`state[3:6]`**: 末端姿态轴角 `[ax, ay, az]`（弧度），基座坐标系
-- **`state[6]`**: 手指1位置（半宽，米）
-- **`state[7]`**: 手指2位置（负半宽，米）
-
----
-
-## Transform Action 变换逻辑
-
-在 vla_control 执行时，会应用以下变换：
-
-```python
-def transform_action(action: np.ndarray) -> np.ndarray:
+def transform_action(action):
     ta = action.copy()
-    
-    # 位置：裁剪 + 缩放
     ta[:3] = np.clip(ta[:3], -POS_CLIP, POS_CLIP) * POS_SCALE
-    # POS_CLIP = 1.0, POS_SCALE = 0.1/3 * 0.1 / 1.0 ≈ 0.0033
-    
-    # 旋转：裁剪 + 缩放
     ta[3:6] = np.clip(ta[3:6], -ROT_CLIP, ROT_CLIP) * ROT_SCALE
-    # ROT_CLIP = 0.1, ROT_SCALE = (π/2)/3 * 0.1 / 0.1 ≈ 0.524
-    
-    # 夹爪：二值化
     ta[6] = 0.0 if ta[6] >= 0 else 0.08
-    
     return ta
 ```
 
-### 参数说明
+对应常量：
 
-- **`POS_CLIP = 1.0`**：位置输入截断范围 `[-1.0, 1.0]` 米
-- **`ROT_CLIP = 0.1`**：旋转输入截断范围 `[-0.1, 0.1]` 弧度
-- **`POS_MAX_VEL = 0.1/3 m/s`**：末端位置最大速度
-- **`ROT_MAX_VEL = π/2/3 rad/s`**：末端旋转最大速度
-- **`CONTROL_DT = 0.1s`**：控制周期（10Hz）
-- **`GRIPPER_SPEED = 0.08 m/s`**：夹爪运动速度
+```python
+CONTROL_DT = 0.1
+POS_CLIP = 1.0
+ROT_CLIP = 0.1
+POS_MAX_VEL = 0.1 / 3
+ROT_MAX_VEL = (math.pi / 4) / 3
+POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
+ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
+```
+
+因此训练数据与执行侧的一致性是：
+
+- 位置动作维度一致
+- 旋转动作维度一致
+- 夹爪动作语义一致
+- 录制频率与执行 action 周期都为 10Hz
+
+但也要注意：
+
+- 采集端内部发布是 50Hz，为了让机械臂运动更平滑
+- 执行侧真正消费模型 action 的周期仍是 10Hz
+
+---
+
+## 轨迹插值与发布
+
+`key_control.py` 不是每次输入直接跳到新位姿，而是先在 10Hz 上生成一拍动作，再在 50Hz 上插值发布。
+
+核心流程：
+
+1. 每 `INPUT_DT=0.1s` 读取一次输入。
+2. 若有动作，更新 `commanded_pose`。
+3. 用 `min_jerk_weight` 在 `0 ~ INPUT_DT` 上生成插值轨迹。
+4. 每 `PUBLISH_DT=0.02s` 发布一次目标 pose。
+
+这样做的结果是：
+
+- 用户输入采样率低，便于录制和对齐
+- 机器人执行率高，避免明显顿挫
+
+---
+
+## 复位与退出
+
+### 复位
+
+调用 `_reset()` 时，当前实现会：
+
+1. 打开夹爪
+2. 终止当前 dynamic skill
+3. 等待发布线程退出
+4. `reset_joints()`
+5. 重新读取当前 pose
+6. 重新启动发布线程
+
+### 退出
+
+- 键盘模式下：`ESC`
+- PS4 模式下：`PS`
+
+退出时 `DataRecorder._on_exit()` 会尝试保存尚未结束但已有帧的轨迹。
+
+---
+
+## 录制逻辑
+
+`DataRecorder` 默认参数：
+
+```python
+COLLECTION_DIR = repo_root / "collected"
+TASK_NAME = "simple_pick_place"
+COLLECT_HZ = 10.0
+MAX_FRAMES = 1000
+ACTION_THRESH_POS = 0.0005
+ACTION_THRESH_ROT = 0.005
+```
+
+录制控制：
+
+- 键盘模式：`1` 开始，`2` 结束
+- PS4 模式：`L3` 开始，`R3` 结束
+
+采集循环只在动作非空时记录：
+
+```python
+return (
+    (np.abs(pos) < self.action_thresh_pos).all()
+    and (np.abs(rot) < self.action_thresh_rot).all()
+)
+```
+
+这意味着：
+
+- 纯静止帧不会写入 `data.csv`
+- 没有位移/旋转但只有夹爪变化时，也会被当作空动作跳过，因为当前过滤逻辑完全不检查 `action[6]`
 
 ---
 
 ## 数据保存格式
 
-### 目录结构
+目录结构：
 
-```
+```text
 collected/
-└── task_name/
-    ├── epo_1/
-    │   ├── cam1.mp4      # 外部相机视频
-    │   ├── cam2.mp4      # 腕部相机视频
-    │   └── data.csv      # 状态-动作数据
-    ├── epo_2/
-    │   └── ...
-    └── ...
+  task_name/
+    epo_1/
+      cam1.mp4
+      cam2.mp4
+      data.csv
+    epo_2/
+      ...
 ```
 
-### CSV 格式
+episode 编号按 `epo_N` 自动递增。
 
-- **第1行**：超参数 JSON（任务名、频率、帧数等）
-- **第2行**：列名 `state_0, state_1, ..., state_7, action_0, ..., action_6`
-- **第3行起**：数据（每行 15 个值）
+### 视频
+
+- `cam1.mp4`
+- `cam2.mp4`
+
+由 `imageio.mimwrite(..., codec="libx264", pixelformat="yuv420p")` 保存，帧率等于 `collect_hz`。
+
+### CSV
+
+`data.csv` 结构：
+
+1. 第 1 行：单列 JSON 元数据
+2. 第 2 行：表头
+3. 第 3 行起：每行 `8 + 7 = 15` 个数值
+
+第 1 行元数据字段：
+
+```json
+{
+  "task_name": "...",
+  "collect_hz": 10.0,
+  "max_frames": 1000,
+  "num_frames": 123
+}
+```
+
+第 2 行列名：
+
+```text
+state_0 ... state_7 action_0 ... action_6
+```
 
 ---
 
-## 与 VLA Control 的对齐
+## 相机行为
 
-### 完全一致的方面
+`DataRecorder` 使用两路 D435：
 
-1. **Action 格式**：`(7,)` 向量，含义完全相同
-2. **旋转坐标系**：均为基座坐标系，左乘叠加
-3. **旋转轴定义**：`[X, Y, Z]` 轴对应 `[droll, dpitch, dyaw]`
-4. **夹爪逻辑**：通过 transform_action 统一处理
-5. **State 格式**：`(8,)` 向量，包含位置、姿态、夹爪
+- `CAM1_SERIAL = "346222072769"`
+- `CAM2_SERIAL = "938422075745"`
 
-### 差异（正常）
+当前实现特点：
 
-1. **控制频率**：采集端 20Hz，录制端 10Hz（与控制循环对齐）
-2. **Action 来源**：采集端来自键盘，执行端来自 VLA 模型
-3. **安全检查**：执行端有额外安全检查，采集端无
+- 某路相机启动失败时，记录 warning，并将该路视为不可用
+- 不可用相机返回全黑帧
+- 因此采集流程不因为单路相机失败而直接崩溃
 
 ---
 
-## 使用流程
+## 依赖
 
-### 1. 启动数据采集
+与采集直接相关的 Python 依赖至少包括：
+
+- `pyrealsense2`
+- `imageio`
+- `imageio-ffmpeg`
+- `pynput`
+- `pygame`，仅 PS4 模式必需
+
+如果使用 PS4 模式但环境里没有 `pygame`，`KeyboardController(input_device="ps4")` 会直接抛错。
+
+---
+
+## 常用命令
+
+默认启动：
 
 ```bash
-cd /home/k324/franka_my_code/vla4desk
+cd /media/czl/sata/franka_my_code/vla4desk
 ./start_data_collector.sh
 ```
 
-或手动启动：
+指定任务名：
 
 ```bash
-cd src/data_collection
-python data_recorder.py --task_name my_task --collect_hz 10
+./start_data_collector.sh --task_name pick_place
 ```
 
-### 2. 录制数据
-
-1. 按 `1` 开始录制
-2. 使用键盘控制机械臂完成任务
-3. 按 `2` 结束录制（自动保存）
-4. 重复步骤 1-3 收集多个 episode
-5. 按 `ESC` 退出
-
-### 3. 检查数据
+使用 PS4：
 
 ```bash
-ls collected/my_task/
-# epo_1/  epo_2/  epo_3/  ...
+./start_data_collector.sh --input_device ps4
 ```
 
----
+手动启动：
 
-## 常见问题
+```bash
+cd /root/Documents/my_code/vla4desk/src/data_collection
+python data_recorder.py --task_name my_task --input_device ps4 --joystick_index 0
+```
 
-### Q: 为什么夹爪信号要用 -1.0/1.0 而不是 0.0/0.08？
-
-A: 为了让 VLA 模型学习**意图**而非精确值。模型只需输出正负号，实际的物理值由 `transform_action` 统一映射。这简化了学习任务，提高了泛化能力。
-
-### Q: 旋转为什么用基座坐标系而不是末端坐标系？
-
-A: 基座坐标系是绝对坐标系，不随末端姿态变化，更容易学习和预测。VLA 模型输出的旋转增量可以直接在基座坐标系中应用，无需坐标变换。
-
-### Q: 采集频率 10Hz 和控制频率 20Hz 不一致会有问题吗？
-
-A: 不会。key_control 以 20Hz 发布控制指令，保证机械臂运动平滑；data_recorder 以 10Hz 采样录制，与 vla_control 的控制循环对齐，确保训练和部署的一致性。
+注意：`start_data_collector.sh` 是在容器里执行 `/root/Documents/my_code/vla4desk/...`，而仓库宿主机路径是 `/media/czl/sata/franka_my_code/vla4desk`，两者都是真实存在的启动路径，只是所处环境不同。
 
 ---
 
 ## 相关文件
 
-- `key_control.py`：键盘遥操作控制器，生成 state 和 action
-- `data_recorder.py`：数据采集器，录制视频和 CSV
-- `../vla_control/franka_env.py`：VLA 执行环境，包含 transform_action
-- `../vla_control/coordinator.py`：主控制器，协调推理和执行
+- `src/data_collection/key_control.py`
+- `src/data_collection/data_recorder.py`
+- `src/vla_control/franka_env.py`
+- `start_data_collector.sh`
+- `requirements.txt`
 
 ---
 
-**最后更新**：2026-04-09
+最后更新：2026-04-12
