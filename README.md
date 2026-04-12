@@ -94,3 +94,17 @@ python src/data_collection/trajectory_replay_recorder.py \
 ```
 
 如果通过 `./start_trajectory_replay.sh` 在 Docker 中启动，`--episode` 同样应传 `collected/...` 这类仓库相对路径，或容器内路径 `/root/Documents/my_code/vla4desk/collected/...`。
+
+### 数据采集
+
+```bash
+# 默认录到 collected/default
+./start_data_collector.sh
+
+# 显式录到常用任务目录名
+./start_data_collector.sh --task_name simple_pick_place
+```
+
+## TODO
+
+- 根据 OpenVLA 数据集中的轴角状态分布，以及真机 `state[3:6]` 的实际观测分布，综合设计一个兼顾连续性、数值稳定性和训练/推理一致性的轴角约束函数。

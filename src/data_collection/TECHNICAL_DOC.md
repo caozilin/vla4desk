@@ -9,7 +9,7 @@
 - `key_control.py`
   负责遥操作控制，支持 `keyboard` 和 `ps4` 两种输入设备。
 - `data_recorder.py`
-  负责双路 D435 取流、空动作过滤、episode 保存。
+  负责双路 D435 取流、基于 `action+state` 的去重过滤、episode 保存。
 
 设计目标不是“录键盘”，而是生成和 `src/vla_control/franka_env.py` 执行侧兼容的 `state/action` 数据格式。
 
@@ -29,13 +29,13 @@ start_data_collector.sh
 运行期职责：
 
 - `KeyboardController`
-  - 初始化 `FrankaArm(with_gripper=True)`
-  - 维护 `commanded_pose / prev_commanded_pose / gripper_target`
   - 以 10Hz 采样输入
-  - 以 50Hz 发布平滑插值后的 dynamic pose 指令
+  - 维护 `gripper_target` 与最近一拍 `state/action` 缓存
+  - 将输入转换为 action，并通过 `FrankaEnv.enqueue_action(..., transform=False)` 送入执行侧
+  - 不直接调用 dynamic skill 接口，避免和 env 的 skill 线程抢占控制面
 - `DataRecorder`
   - 以 10Hz 采样 `state/action`
-  - 过滤空动作
+  - 仅在“action 近零且 state 与上一条已录制 state 基本一致”时跳过
   - 在录制开启时缓存图像和数据
   - 保存为 `cam1.mp4`、`cam2.mp4`、`data.csv`
 
@@ -49,6 +49,12 @@ start_data_collector.sh
 
 ```bash
 ./start_data_collector.sh
+```
+
+默认 `task_name` 是 `default`。如果希望直接写到以前常用的任务目录名，可以显式传：
+
+```bash
+./start_data_collector.sh --task_name simple_pick_place
 ```
 
 也可以显式指定：
@@ -138,19 +144,15 @@ PS4_BUTTON_PS = 12
 
 ```python
 INPUT_DT = 0.1
-PUBLISH_DT = 0.02
 MAX_LIN_VEL = 0.1
 MAX_ROT_VEL = math.pi / 4
-GRIPPER_SPEED = 0.08
 ```
 
 含义：
 
 - 输入采样频率：10Hz
-- 控制发布频率：50Hz
 - 最大线速度：`0.1 m/s`
 - 最大角速度：`pi/4 rad/s`
-- 夹爪速度：`0.08 m/s`
 
 单次输入采样对应的最大增量：
 
@@ -174,6 +176,12 @@ _speed_levels = [0.4, 0.7, 1.0]
 - `_speed_levels`
 
 也就是说，手柄不是另一套速度体系，只是另一种输入源。
+
+这里的速度上限是采集侧独立配置。
+
+- `KeyboardController` 会直接按这套上限生成实际执行尺度的 action
+- 送入 `FrankaEnv` 时使用 `transform=False`
+- 因此不会复用 `FrankaEnv` 的推理侧 clip/scale 逻辑
 
 ---
 
@@ -216,11 +224,39 @@ action = [delta_pos(3), delta_axisangle(3), gripper_cmd(1)]
 具体来源：
 
 - `action[:3]`
-  `commanded_pose.translation - prev_commanded_pose.translation`
+  当前 10Hz 输入采样拍上的目标位置增量，按基座坐标系表达
 - `action[3:6]`
-  `commanded_pose.rotation @ prev_commanded_pose.rotation.T` 的轴角
+  当前 10Hz 输入采样拍上的目标旋转增量，输出时按基座坐标系 rotvec 表达
 - `action[6]`
   二值夹爪意图，不是物理宽度
+
+旋转的坐标系约定需要特别注意：
+
+- 键盘和 PS4 的旋转输入，手感上按末端自身坐标系解释
+- 但写入数据集和送入 `FrankaEnv` 的 `action[3:6]`，一定转换成基座坐标系 rotvec
+- 这样可以同时满足“示教手感”与“数据/执行语义统一”
+
+代码上，当前拍的局部旋转增量会按当前末端姿态做共轭变换：
+
+```python
+delta_local = Rotation.from_rotvec(local_rot_delta).as_matrix()
+delta_base = current_rot @ delta_local @ current_rot.T
+delta_rot_base = Rotation.from_matrix(delta_base).as_rotvec()
+```
+
+输入线程每个采样拍会：
+
+1. 读取当前机器人 state
+2. 读取键盘/PS4 输入
+3. 将旋转输入从末端系转换到基座系
+4. 生成 `(7,) action`
+5. 调用 `self.env.enqueue_action(action, transform=False)`
+
+因此：
+
+- 本拍有输入：`action` 表示本拍输入增量
+- 本拍没输入：`action[:6]` 为零
+- `action` 不再通过 `commanded_pose - prev_commanded_pose` 反推
 
 夹爪编码：
 
@@ -274,26 +310,26 @@ ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
 
 但也要注意：
 
-- 采集端内部发布是 50Hz，为了让机械臂运动更平滑
-- 执行侧真正消费模型 action 的周期仍是 10Hz
+- 采集端不会自己再开一套 50Hz 发布线程
+- 真正的 dynamic skill 生命周期和 sensor message 发布都由 `FrankaEnv` 独占
+- 采集端只负责以 10Hz 送 action，底层插值与发布由 `FrankaEnv` 内部处理
 
 ---
 
-## 轨迹插值与发布
+## 控制与线程模型
 
-`key_control.py` 不是每次输入直接跳到新位姿，而是先在 10Hz 上生成一拍动作，再在 50Hz 上插值发布。
+当前 `key_control.py` 的线程职责是：
 
-核心流程：
+- 输入线程：10Hz 读取输入，生成 action，送入 `FrankaEnv`
+- env skill 线程：由 `FrankaEnv` 独占控制 dynamic pose skill 和底层插值发布
 
-1. 每 `INPUT_DT=0.1s` 读取一次输入。
-2. 若有动作，更新 `commanded_pose`。
-3. 用 `min_jerk_weight` 在 `0 ~ INPUT_DT` 上生成插值轨迹。
-4. 每 `PUBLISH_DT=0.02s` 发布一次目标 pose。
+这样做的约束是：
 
-这样做的结果是：
+- `key_control.py` 不允许直接调用 `goto_pose(dynamic=True)`
+- `key_control.py` 不允许直接 `publish_sensor_data(...)`
+- `key_control.py` 不允许自行发送 `ShouldTerminateSensorMessage`
 
-- 用户输入采样率低，便于录制和对齐
-- 机器人执行率高，避免明显顿挫
+这些接口都只应由 `FrankaEnv._skill_loop()` 使用，避免键控线程和循环线程抢占同一 interface skill。
 
 ---
 
@@ -303,12 +339,11 @@ ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
 
 调用 `_reset()` 时，当前实现会：
 
-1. 打开夹爪
-2. 终止当前 dynamic skill
-3. 等待发布线程退出
-4. `reset_joints()`
-5. 重新读取当前 pose
-6. 重新启动发布线程
+1. 更新 `gripper_target`
+2. 调用 `env.home_and_restart()`
+3. 刷新本地缓存的 `state/action`
+
+也就是说，复位也统一通过 `FrankaEnv` 串行处理，而不是采集侧自己终止/重启 skill。
 
 ### 退出
 
@@ -325,7 +360,7 @@ ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
 
 ```python
 COLLECTION_DIR = repo_root / "collected"
-TASK_NAME = "simple_pick_place"
+TASK_NAME = "default"
 COLLECT_HZ = 10.0
 MAX_FRAMES = 1000
 ACTION_THRESH_POS = 0.0005
@@ -337,19 +372,19 @@ ACTION_THRESH_ROT = 0.005
 - 键盘模式：`1` 开始，`2` 结束
 - PS4 模式：`L3` 开始，`R3` 结束
 
-采集循环只在动作非空时记录：
+采集循环不是“只看 action 非空就记录”，而是同时检查：
 
 ```python
-return (
-    (np.abs(pos) < self.action_thresh_pos).all()
-    and (np.abs(rot) < self.action_thresh_rot).all()
-)
+if self._is_action_empty(action) and self._is_state_same_as_last_recorded(state):
+    self.stats["skipped_frames"] += 1
+    return
 ```
 
 这意味着：
 
 - 纯静止帧不会写入 `data.csv`
-- 没有位移/旋转但只有夹爪变化时，也会被当作空动作跳过，因为当前过滤逻辑完全不检查 `action[6]`
+- 即使 `action` 近零，只要当前 `state` 与上一条已录制样本有明显差异，仍然会记录
+- 当前 `_is_action_empty()` 仍然不检查 `action[6]`，所以夹爪-only 的过滤行为最终还取决于 `state` 是否变化
 
 ---
 
@@ -445,6 +480,7 @@ cd /media/czl/sata/franka_my_code/vla4desk
 指定任务名：
 
 ```bash
+./start_data_collector.sh --task_name simple_pick_place
 ./start_data_collector.sh --task_name pick_place
 ```
 

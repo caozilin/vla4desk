@@ -300,6 +300,17 @@ ROTATIONAL_STIFFNESS = FC.DEFAULT_ROTATIONAL_STIFFNESSES
 - 前端可以读取最新目标位姿和末端力矩
 - 旋转向量在跨帧时尽量保持连续
 
+旋转向量相关 helper 的职责分工：
+
+- `normalize_rotvec(rotvec)`
+  只做单帧规范化，把角度折叠到 `[-pi, pi]`，不关心跨帧连续性
+- `normalize_rotvec_with_history(rotvec, prev_rotvec)`
+  在单帧规范化基础上，结合上一帧做 unwrap，尽量减少相邻帧在 `±pi` 附近的跳变
+- `_set_commanded_pose_array()`
+  用单帧规范化后的 rotvec 更新目标位姿显示
+- `_refresh_robot_cache()`
+  用带历史的规范化结果更新实际位姿缓存，优先保证观测和遥测的时间连续性
+
 线程同步使用：
 
 - `_lock`

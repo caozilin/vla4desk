@@ -1,6 +1,7 @@
 #!/bin/bash
 # 用法：
 #   ./start_data_collector.sh                    # 默认参数
+#   ./start_data_collector.sh --task_name simple_pick_place
 #   ./start_data_collector.sh --task_name pick_place  # 指定任务
 #   ./start_data_collector.sh --input_device ps4      # 使用 PS4 二代手柄
 #   ./start_data_collector.sh --input_device ps4 --joystick_index 0
