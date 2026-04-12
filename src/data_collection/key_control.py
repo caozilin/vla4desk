@@ -3,11 +3,11 @@
 Franka Panda 键盘遥操作控制器
 =============================
 提供：
-  - 双频率控制循环：
-    * 10Hz 输入采样：读取按键并计算 action 增量
-    * 50Hz 发布循环：对 action 增量做 min-jerk 插值，平滑发布目标位姿
-  - 按键 → 位姿增量的映射（位置与旋转都在基座坐标系表达）
-  - 命令位姿追踪（commanded_pose / prev_commanded_pose）
+  - 10Hz 输入采样：读取按键并计算当前这拍的 action 增量
+  - 通过 FrankaEnv.enqueue_action() 将动作送入唯一的 dynamic skill 执行线程
+  - 按键 → 位姿增量的映射（平移按基座系，旋转输入按末端系解释）
+  - 输出 action 统一使用基座坐标系 rotvec 语义
+  - 保持采集侧独立的最大速度配置，不复用 env 的动作缩放
 
 本文件不涉及录制逻辑，供 data_recorder.py 等模块引用。
 """
@@ -15,23 +15,15 @@ Franka Panda 键盘遥操作控制器
 import logging
 import math
 import os
+import pathlib
+import sys
 import threading
 import time
 
 import numpy as np
 
-from frankapy.utils import min_jerk, min_jerk_weight
 from pynput import keyboard
 from scipy.spatial.transform import Rotation
-
-from autolab_core import RigidTransform
-from frankapy import FrankaArm, SensorDataMessageType, FrankaConstants as FC
-from frankapy.proto_utils import sensor_proto2ros_msg, make_sensor_group_msg
-from frankapy.proto import (
-    PosePositionSensorMessage,
-    ShouldTerminateSensorMessage,
-    CartesianImpedanceSensorMessage,
-)
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 try:
@@ -40,19 +32,19 @@ except ModuleNotFoundError:
     pygame = None
 
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src" / "vla_control"))
+
+from franka_env import FrankaEnv
+
+
 # ==================================================================
 # 控制参数
 # ==================================================================
 
-INPUT_DT = 0.1               # 输入采样间隔 100ms (10Hz) - 读取按键并计算action增量
-PUBLISH_DT = 0.02             # 发布间隔 20ms (50Hz) - 对action增量进行min_jerk插值后发布
+INPUT_DT = 0.1               # 输入采样间隔 100ms (10Hz)
 MAX_LIN_VEL = 0.1             # 最大线速度 0.1 m/s
 MAX_ROT_VEL = math.pi / 4     # 最大角速度 45°/s
-GRIPPER_SPEED = 0.08          # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
-
-DEFAULT_TRANS_STIFF = FC.DEFAULT_TRANSLATIONAL_STIFFNESSES
-DEFAULT_ROT_STIFF = FC.DEFAULT_ROTATIONAL_STIFFNESSES
-
 MAX_DELTA_POS = MAX_LIN_VEL * INPUT_DT     # 0.01 m
 MAX_DELTA_ROT = MAX_ROT_VEL * INPUT_DT     # ≈ 0.0785 rad
 JOYSTICK_DEADZONE = 0.12
@@ -82,32 +74,29 @@ PS4_BUTTON_PS = 12
 # ==================================================================
 
 class KeyboardController:
-    """独立的键盘遥操作控制类。
+    """输入控制器。
 
     使用方式（推荐）：
         kc = KeyboardController()
-        kc.start()                # 启动控制线程（非阻塞）
+        kc.start()                # 启动 env skill + 输入线程（非阻塞）
         # 自行管理 keyboard.Listener
         with keyboard.Listener(...) as listener:
             listener.join()
         kc.stop()
 
     公开属性（线程安全）：
-        commanded_pose      RigidTransform  当前目标位姿
-        prev_commanded_pose RigidTransform 上一拍目标位姿（用于计算 action）
-        gripper_target     float          夹爪目标宽度 (m)
-        step_size          float          当前速度倍率，取值来自 [0.4, 0.7, 1.0]
-        running            bool           程序是否在运行
+        gripper_target     float 夹爪目标宽度 (m)
+        step_size          float 当前速度倍率，取值来自 [0.4, 0.7, 1.0]
+        running            bool  程序是否在运行
     """
 
     def __init__(self, input_device: str = "keyboard", joystick_index: int = 0):
         if input_device not in ("keyboard", "ps4"):
             raise ValueError(f"不支持的输入设备: {input_device}")
 
-        self.fa = FrankaArm(with_gripper=True)
-        self.fa.reset_joints()
         self.input_device = input_device
         self.joystick_index = joystick_index
+        self.env = FrankaEnv()
 
         self.gripper_target = 0.04   # 默认半开
         self.step_size = 0.7          # 速度倍率：3档 [0.4, 0.7, 1.0]
@@ -119,19 +108,14 @@ class KeyboardController:
         self.keys_pressed: set = set()
         self._keys_lock = threading.Lock()
 
-        # 命令位姿（由 _publish_loop 更新，外部读取）
-        self._pose_lock = threading.Lock()
-        self._current_pose: RigidTransform | None = None
-        self._commanded_pose: RigidTransform | None = None
-        self._prev_commanded_pose: RigidTransform | None = None
-
         # 线程管理
-        self._pub_thread: threading.Thread | None = None
+        self._input_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._reset_lock = threading.Lock()  # 防止并发复位
 
         # 状态缓存
-        self._cached_gripper_width = self.fa.get_gripper_width()
+        self._latest_state = np.zeros(8, dtype=np.float64)
+        self._latest_action = np.zeros(7, dtype=np.float64)
 
         # 手柄事件
         self._event_callbacks: dict[str, callable] = {}
@@ -148,21 +132,25 @@ class KeyboardController:
     # ------------------------------------------------------------------
 
     def start(self):
-        """启动控制线程（daemon），不阻塞。"""
-        # 直接调用复位操作来初始化
+        """启动 env 与输入线程（daemon），不阻塞。"""
         self._print_controls()
-        self._reset()
+        self.env.start_control()
+        self._latest_state = self.env.get_robot_state_vector()
+        self._latest_action = np.zeros(7, dtype=np.float64)
+        self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
+        self._input_thread.start()
 
     def stop(self):
         """停止控制线程，等待其退出。"""
         self.running = False
         self._stop_event.set()
         if (
-            self._pub_thread
-            and self._pub_thread.is_alive()
-            and threading.current_thread() is not self._pub_thread
+            self._input_thread
+            and self._input_thread.is_alive()
+            and threading.current_thread() is not self._input_thread
         ):
-            self._pub_thread.join(timeout=2.0)
+            self._input_thread.join(timeout=2.0)
+        self.env.stop_control()
         self._shutdown_ps4()
 
     def bind_event(self, event_name: str, callback):
@@ -374,112 +362,85 @@ class KeyboardController:
             return self._get_ps4_delta()
         return self._get_keyboard_delta()
 
-    # ------------------------------------------------------------------
-    # 控制线程
-    # ------------------------------------------------------------------
+    def _convert_local_rot_delta_to_base(
+        self,
+        local_rot_delta: np.ndarray,
+        state: np.ndarray | None,
+    ) -> np.ndarray:
+        """将末端系旋转增量转换为基座系 rotvec。
 
-    def _publish_loop(self):
-        """控制循环 (50Hz)：
-        - 读取按键并计算 action 增量
-        - 使用 min_jerk 插值生成平滑轨迹
-        - 发布目标位姿
+        输入设备的旋转操控按末端自身坐标系解释，但输出 action 语义必须与
+        vla_control 保持一致，即 rotvec 在基座坐标系表达。
         """
-        fa = self.fa
-        seq_id = 0
+        local_rot_delta = np.asarray(local_rot_delta, dtype=np.float64)
+        if np.linalg.norm(local_rot_delta) < 1e-12:
+            return local_rot_delta.copy()
 
-        self._current_pose = fa.get_pose()
-        self._commanded_pose = self._current_pose.copy()
-        self._prev_commanded_pose = self._current_pose.copy()
+        if state is None or state.shape[0] < 6:
+            current_rot = np.eye(3, dtype=np.float64)
+        else:
+            current_rot = Rotation.from_rotvec(state[3:6]).as_matrix()
 
-        self._trajectory: list[RigidTransform] = []
-        self._trajectory_index = 0
-        self._trajectory_start_time = 0.0
+        delta_local = Rotation.from_rotvec(local_rot_delta).as_matrix()
+        delta_base = current_rot @ delta_local @ current_rot.T
+        return Rotation.from_matrix(delta_base).as_rotvec()
 
-        fa.goto_pose(
-            self._commanded_pose,
-            duration=1000.0,
-            dynamic=True,
-            buffer_time=20.0,
-            cartesian_impedances=DEFAULT_TRANS_STIFF + DEFAULT_ROT_STIFF,
-            block=False
+    # ------------------------------------------------------------------
+    # 输入线程
+    # ------------------------------------------------------------------
+
+    def _build_action(
+        self,
+        dx: float,
+        dy: float,
+        dz: float,
+        droll: float,
+        dpitch: float,
+        dyaw: float,
+        state: np.ndarray | None,
+    ) -> np.ndarray:
+        delta_rot_base = self._convert_local_rot_delta_to_base(
+            np.array([droll, dpitch, dyaw], dtype=np.float64),
+            state,
         )
-        init_time = fa.get_time()
+        action = np.array(
+            [dx, dy, dz, *delta_rot_base.tolist(), 0.0],
+            dtype=np.float64,
+        )
+        action[6] = 1.0 if self.gripper_target < 0.04 else -1.0
+        return action
 
-        last_input_time = time.time()
+    def _input_loop(self):
+        """10Hz 输入采样线程。
 
+        这个线程只负责：
+        - 读取输入设备
+        - 生成当前拍 action
+        - 通过 FrankaEnv.enqueue_action() 送给唯一的 skill loop
+
+        它不直接调用 dynamic skill 接口，避免与 env 的执行线程抢占控制面。
+        """
+        next_tick = time.perf_counter()
         while self.running and not self._stop_event.is_set():
-            t_loop_start = time.time()
-            timestamp = fa.get_time() - init_time
-            current_time = time.time()
+            loop_start = time.perf_counter()
+            state = self.env.get_robot_state_vector()
+            dx, dy, dz, droll, dpitch, dyaw = self._get_input_delta()
+            action = self._build_action(dx, dy, dz, droll, dpitch, dyaw, state)
+            self._latest_action = action.copy()
+            self.env.enqueue_action(action, transform=False)
+            self._latest_state = state.copy()
 
-            if current_time - last_input_time >= INPUT_DT:
-                last_input_time = current_time
-                dx, dy, dz, droll, dpitch, dyaw = self._get_input_delta()
+            next_tick += INPUT_DT
+            now = time.perf_counter()
+            sleep_time = next_tick - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                continue
 
-                moved = dx or dy or dz or droll or dpitch or dyaw
-
-                if moved:
-                    self._prev_commanded_pose = self._commanded_pose.copy()
-
-                    self._commanded_pose.translation[0] += dx
-                    self._commanded_pose.translation[1] += dy
-                    self._commanded_pose.translation[2] += dz
-
-                    if droll or dpitch or dyaw:
-                        delta_rotvec = np.array([droll, dpitch, dyaw])
-                        angle = np.linalg.norm(delta_rotvec)
-                        if angle > 1e-6:
-                            delta_rot = Rotation.from_rotvec(delta_rotvec).as_matrix()
-                            self._commanded_pose.rotation = delta_rot @ self._commanded_pose.rotation
-
-                    ts = np.arange(0, INPUT_DT + PUBLISH_DT, PUBLISH_DT)
-                    weights = [min_jerk_weight(t, INPUT_DT) for t in ts]
-                    self._trajectory = [
-                        self._prev_commanded_pose.interpolate_with(self._commanded_pose, w)
-                        for w in weights
-                    ]
-                    self._trajectory_index = 0
-                    self._trajectory_start_time = timestamp
-
-                self._current_pose = fa.get_pose()
-                self._cached_gripper_width = fa.get_gripper_width()
-
-            if self._trajectory and self._trajectory_index < len(self._trajectory):
-                target_pose = self._trajectory[self._trajectory_index]
-                traj_time = timestamp - self._trajectory_start_time
-
-                msg_pose = PosePositionSensorMessage(
-                    id=seq_id, timestamp=traj_time,
-                    position=target_pose.translation,
-                    quaternion=target_pose.quaternion
-                )
-                msg_imp = CartesianImpedanceSensorMessage(
-                    id=seq_id, timestamp=traj_time,
-                    translational_stiffnesses=DEFAULT_TRANS_STIFF,
-                    rotational_stiffnesses=DEFAULT_ROT_STIFF
-                )
-                ros_msg = make_sensor_group_msg(
-                    trajectory_generator_sensor_msg=sensor_proto2ros_msg(
-                        msg_pose, SensorDataMessageType.POSE_POSITION),
-                    feedback_controller_sensor_msg=sensor_proto2ros_msg(
-                        msg_imp, SensorDataMessageType.CARTESIAN_IMPEDANCE)
-                )
-                fa.publish_sensor_data(ros_msg)
-                self._trajectory_index += 1
-                seq_id += 1
-
-            elapsed = time.time() - t_loop_start
-            time.sleep(max(0, PUBLISH_DT - elapsed))
-
-        term_msg = ShouldTerminateSensorMessage(
-            timestamp=fa.get_time() - init_time, should_terminate=True
-        )
-        term_ros_msg = make_sensor_group_msg(
-            termination_handler_sensor_msg=sensor_proto2ros_msg(
-                term_msg, SensorDataMessageType.SHOULD_TERMINATE)
-        )
-        fa.publish_sensor_data(term_ros_msg)
-        time.sleep(0.1)
+            # 超时后按当前时刻重置 deadline，避免长期累积漂移。
+            if now - loop_start > INPUT_DT:
+                logging.warning("Keyboard input loop overran by %.1fms", (now - next_tick) * 1000.0)
+            next_tick = now
 
     # ------------------------------------------------------------------
     # 夹爪 & 复位
@@ -488,85 +449,27 @@ class KeyboardController:
     def _close_gripper(self):
         print("  [夹爪] 关闭")
         self.gripper_target = 0.0
-        self.fa.goto_gripper(width=0.0, grasp=True, block=False, speed=GRIPPER_SPEED)
 
     def _open_gripper(self):
         print("  [夹爪] 打开")
         self.gripper_target = 0.08
-        self.fa.goto_gripper(width=0.08, block=False, speed=GRIPPER_SPEED)
 
     def _half_gripper(self):
         print("  [夹爪] 半开 (0.04m)")
         self.gripper_target = 0.04
-        self.fa.goto_gripper(width=0.04, block=False, speed=GRIPPER_SPEED)
 
     def _reset(self):
-        """平滑回到初始位姿（home）并打开夹爪。"""
-        # 防止并发复位
+        """通过 FrankaEnv 串行执行 home + restart，避免和 skill loop 抢接口。"""
         if not self._reset_lock.acquire(blocking=False):
             print("  [复位] 正在复位中，请勿重复操作")
             return
-        
+
         try:
             print("  [复位] 回到初始位姿...")
-            
-            # 1. 打开夹爪
             self.gripper_target = 0.08
-            self.fa.open_gripper(block=False)
-            
-            # 2. 停止当前的 dynamic skill 和 publish_loop
-            self.running = False
-            self._stop_event.set()
-            
-            fa = self.fa
-            term_msg = ShouldTerminateSensorMessage(
-                timestamp=fa.get_time(), should_terminate=True
-            )
-            term_ros_msg = make_sensor_group_msg(
-                termination_handler_sensor_msg=sensor_proto2ros_msg(
-                    term_msg, SensorDataMessageType.SHOULD_TERMINATE)
-            )
-            fa.publish_sensor_data(term_ros_msg)
-            time.sleep(0.5)
-            
-            # 等待 publish_loop 线程退出
-            if (
-                self._pub_thread is not None
-                and self._pub_thread.is_alive()
-                and threading.current_thread() is not self._pub_thread
-            ):
-                self._pub_thread.join(timeout=2.0)
-                self._pub_thread = None
-            elif threading.current_thread() is self._pub_thread:
-                self._pub_thread = None
-            
-            # 3. 回到 home 位姿
-            try:
-                fa.reset_joints()
-            except Exception as e:
-                print(f"  [复位] 警告: reset_joints 异常: {e}")
-                # 如果失败，尝试使用 goto_joints
-                from frankapy import FrankaConstants as FC
-                fa.goto_joints(FC.DEFAULT_JOINT_POSITIONS, duration=3.0, block=True)
-            
-            # 等待 ROS 节点完全稳定，避免 spin_once 重入
-            time.sleep(1.0)
-            
-            # 4. 更新 commanded_pose 为新的 home 位姿
-            self._current_pose = self.fa.get_pose()
-            with self._pose_lock:
-                self._commanded_pose = self._current_pose.copy()
-                self._prev_commanded_pose = self._current_pose.copy()
-            
-            # 5. 重新启动 dynamic skill 和 publish_loop
-            self._stop_event.clear()
-            self.running = True
-            self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
-            self._pub_thread.start()
-            
-            # 等待新线程启动并初始化完成
-            time.sleep(0.5)
-            
+            self.env.home_and_restart()
+            self._latest_state = self.env.get_robot_state_vector()
+            self._latest_action = self._build_action(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self._latest_state)
             print("  [复位] 完成")
         finally:
             self._reset_lock.release()
@@ -581,44 +484,6 @@ class KeyboardController:
         state  : (8,) [pos(3), rotvec(3), finger1(1), finger2(1)]
         action : (7,) [delta_pos(3), delta_axisangle(3), gripper_cmd(1)]
 
-        其中 action = commanded_pose - prev_commanded_pose（用户输入的位姿增量）。
-        旋转增量在基座坐标系中表达（与 vla_control 一致）。
-        action 格式与 vla_control 完全一致，可用于训练 VLA 模型。
+        action 为当前 10Hz 输入采样拍送入 FrankaEnv 的动作。
         """
-        with self._pose_lock:
-            pos = self._current_pose.translation
-            rotvec = Rotation.from_matrix(
-                self._current_pose.rotation
-            ).as_rotvec()
-
-            half = self._cached_gripper_width / 2.0
-            state = np.concatenate([pos, rotvec, [half], [-half]])
-
-            delta = np.zeros(7)
-            if self._prev_commanded_pose is not None:
-                # 位置增量：基座坐标系
-                delta[:3] = (
-                    self._commanded_pose.translation
-                    - self._prev_commanded_pose.translation
-                )
-                # 旋转增量：基座坐标系（与 vla_control 的 _compute_target_pose 一致）
-                # diff_rot = R_current @ R_prev.T 表示从 prev 到 current 的旋转（在基座坐标系）
-                diff_rot = (
-                    self._commanded_pose.rotation
-                    @ self._prev_commanded_pose.rotation.T
-                )
-                delta[3:6] = Rotation.from_matrix(diff_rot).as_rotvec()
-            
-            # 夹爪目标：与 vla_control 的 transform_action 完全一致
-            # vla_control: ta[6] = 0.0 if ta[6] >= 0 else 0.08
-            #   - ta[6] >= 0 → 0.0（闭合）
-            #   - ta[6] < 0  → 0.08（打开）
-            # 这里：gripper_target 表示期望开口宽度
-            #   - gripper_target < 0.04 → 闭合意图 → 输出 >= 0 的值 → transform 后为 0.0
-            #   - gripper_target >= 0.04 → 打开意图 → 输出 < 0 的值 → transform 后为 0.08
-            if self.gripper_target < 0.04:
-                delta[6] = 1.0   # 闭合意图，transform_action 会映射为 0.0
-            else:
-                delta[6] = -1.0  # 打开意图，transform_action 会映射为 0.08
-
-            return state, delta
+        return self._latest_state.copy(), self._latest_action.copy()

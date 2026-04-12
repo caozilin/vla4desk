@@ -5,101 +5,381 @@
 <title>VLA4Desk</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #1a1a1a; color: #eee; font-family: monospace; padding: 16px; }
-  h1 { font-size: 1.2rem; margin-bottom: 12px; color: #adf; }
-  .cameras { display: flex; gap: 12px; margin-bottom: 12px; width: 80%; }
-  .cam-box { flex: 1; }
-  .cam-box label { font-size: 0.75rem; color: #888; display: block; margin-bottom: 4px; }
-  .cam-box img { width: 100%; border: 1px solid #444; background: #000; display: block; }
-  .controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
-  button {
-    padding: 8px 18px; border: none; border-radius: 4px;
-    font-size: 0.9rem; cursor: pointer; font-family: monospace;
+  :root {
+    --bg: #101314;
+    --panel: #171c1e;
+    --panel-2: #1f2629;
+    --border: #2e3a3f;
+    --text: #eff6f2;
+    --muted: #8fa2a2;
+    --accent: #7ce0b8;
+    --warn: #f0b458;
+    --danger: #eb6b63;
+    --robot: #91a6ff;
   }
-  #btn-start  { background: #2a7a2a; color: #fff; }
-  #btn-stop   { background: #7a2a2a; color: #fff; }
-  #btn-home   { background: #2a4a7a; color: #fff; }
-  button:disabled { opacity: 0.4; cursor: default; }
-  .prompt-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  body {
+    background:
+      radial-gradient(circle at top left, rgba(124, 224, 184, 0.12), transparent 32%),
+      radial-gradient(circle at top right, rgba(145, 166, 255, 0.10), transparent 28%),
+      var(--bg);
+    color: var(--text);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    padding: 18px;
+  }
+  h1 { font-size: 1.3rem; margin-bottom: 14px; color: #d5fff0; letter-spacing: 0.04em; }
+  .page { display: grid; gap: 14px; }
+  .panel {
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.00)), var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 12px;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+  }
+  .topbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr);
+    gap: 14px;
+    align-items: stretch;
+  }
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: 10px;
+  }
+  .summary-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
+    min-height: 78px;
+  }
+  .summary-label { font-size: 0.72rem; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .summary-value { font-size: 1rem; color: var(--text); font-weight: 700; }
+  .summary-sub { font-size: 0.74rem; color: var(--muted); margin-top: 6px; }
+  .state-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: #121719;
+    font-size: 0.92rem;
+    font-weight: 700;
+  }
+  .state-idle { color: #b2c4c4; }
+  .state-running { color: #98ffca; }
+  .state-homing { color: #9fb7ff; }
+  .record-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #3d4646;
+    box-shadow: 0 0 0 0 rgba(235, 107, 99, 0.4);
+  }
+  .record-dot.active {
+    background: var(--danger);
+    animation: pulse 1.2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(235, 107, 99, 0.50); }
+    70% { box-shadow: 0 0 0 8px rgba(235, 107, 99, 0.00); }
+    100% { box-shadow: 0 0 0 0 rgba(235, 107, 99, 0.00); }
+  }
+  .prompt-panel { display: grid; gap: 10px; }
+  .prompt-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .prompt-current {
+    min-height: 48px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: #e5f4ef;
+    line-height: 1.45;
+  }
+  .prompt-row { display: flex; gap: 8px; }
   #prompt-input {
-    flex: 1; padding: 8px; background: #2a2a2a; border: 1px solid #555;
-    color: #eee; font-family: monospace; font-size: 0.9rem; border-radius: 4px;
+    flex: 1;
+    padding: 10px 12px;
+    background: #111617;
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.92rem;
+    border-radius: 10px;
   }
-  #btn-send-prompt { background: #444; color: #eee; }
-  .status-bar {
-    font-size: 0.8rem; color: #888; padding: 6px 0;
-    border-top: 1px solid #333;
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    padding: 9px 16px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    font-family: inherit;
+    transition: transform 120ms ease, opacity 120ms ease;
   }
-  #state-badge {
-    display: inline-block; padding: 2px 10px; border-radius: 3px;
-    font-weight: bold; font-size: 0.85rem; margin-left: 8px;
+  button:hover { transform: translateY(-1px); }
+  #btn-start  { background: #225d45; color: #fff; border-color: #2a8561; }
+  #btn-stop   { background: #632d2d; color: #fff; border-color: #8e4343; }
+  #btn-home   { background: #22385d; color: #fff; border-color: #365b93; }
+  #btn-send-prompt { background: #313c40; color: #eaf4f2; border-color: #47585f; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .conn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .conn-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 0.8rem;
   }
-  .state-idle    { background: #333; color: #aaa; }
-  .state-running { background: #1a4a1a; color: #4f4; }
-  .state-homing  { background: #1a2a4a; color: #48f; }
-  #rec-indicator {
-    display: inline-block; width: 8px; height: 8px;
-    border-radius: 50%; background: #555; margin-left: 12px;
-    vertical-align: middle;
-  }
-  #rec-indicator.active { background: #f44; animation: blink 1s infinite; }
-  @keyframes blink { 50% { opacity: 0.3; } }
   .conn-dot {
-    display: inline-block; width: 8px; height: 8px;
-    border-radius: 50%; background: #555; margin-left: 6px;
-    vertical-align: middle;
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #5d6668;
   }
-  .conn-dot.on { background: #4f4; }
-  .conn-label { font-size: 0.75rem; color: #888; margin-left: 12px; }
+  .conn-dot.on { background: var(--accent); }
+  .main-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.95fr);
+    gap: 14px;
+  }
+  .camera-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 240px;
+    gap: 12px;
+    align-items: start;
+  }
+  .cam-stack { display: grid; gap: 12px; }
+  .cam-box label, .section-title, .metrics-title {
+    font-size: 0.75rem;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .cam-box img {
+    width: 100%;
+    border: 1px solid var(--border);
+    background: #000;
+    display: block;
+    border-radius: 12px;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+  }
+  .camera-main {
+    position: relative;
+    overflow: hidden;
+    border-radius: 12px;
+  }
+  .camera-overlay {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.74rem;
+    color: #e8f7f2;
+  }
+  .overlay-chip {
+    padding: 6px 8px;
+    border-radius: 999px;
+    background: rgba(10, 14, 15, 0.72);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .metrics-panel { display: grid; gap: 12px; }
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .metric-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
+  }
+  .metric-card.warn { border-color: rgba(240, 180, 88, 0.5); box-shadow: inset 0 0 0 1px rgba(240, 180, 88, 0.15); }
+  .metric-value {
+    font-size: 1.28rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .metric-sub {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+  .telemetry-section {
+    display: grid;
+    gap: 12px;
+  }
   .telemetry {
-    display: flex; gap: 12px; margin-top: 10px;
-    font-size: 0.75rem; color: #888;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    font-size: 0.76rem;
   }
   .tele-box {
-    flex: 1; background: #222; border: 1px solid #333;
-    border-radius: 4px; padding: 6px 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
   }
-  .tele-box label { color: #666; display: block; margin-bottom: 4px; }
-  .tele-row { display: flex; justify-content: space-between; }
-  .tele-key { color: #666; }
-  .tele-val { color: #cde; font-variant-numeric: tabular-nums; }
+  .tele-box label { color: var(--muted); display: block; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .tele-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 5px 0;
+    border-top: 1px solid rgba(255,255,255,0.03);
+  }
+  .tele-row:first-of-type { border-top: none; }
+  .tele-key { color: #7f9192; }
+  .tele-val {
+    color: #d8f5ef;
+    font-variant-numeric: tabular-nums;
+    transition: color 120ms ease, text-shadow 120ms ease;
+  }
+  .tele-val.changed {
+    color: #ffffff;
+    text-shadow: 0 0 10px rgba(124, 224, 184, 0.55);
+  }
+  .tele-val.warn { color: #ffd187; }
+  .tele-val.danger { color: #ff8f87; }
+  .muted { color: var(--muted); }
+  @media (max-width: 1200px) {
+    .topbar, .main-grid, .camera-panel, .telemetry { grid-template-columns: 1fr; }
+    .summary { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+  }
+  @media (max-width: 720px) {
+    body { padding: 12px; }
+    .summary, .metric-grid, .telemetry { grid-template-columns: 1fr; }
+    .prompt-row, .controls { flex-direction: column; }
+    button { width: 100%; }
+  }
 </style>
 </head>
 <body>
 <h1>VLA4Desk</h1>
 
-<div class="cameras">
-  <div class="cam-box">
-    <label>外部相机 (cam1)</label>
-    <img id="img1" alt="cam1">
+<div class="page">
+  <div class="topbar">
+    <div class="panel">
+      <div class="summary">
+        <div class="summary-card">
+          <div class="summary-label">Controller</div>
+          <div class="summary-value"><span id="state-badge" class="state-pill state-idle">idle</span></div>
+          <div class="summary-sub">控制状态机</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Recording</div>
+          <div class="summary-value"><span id="rec-indicator" class="record-dot" title="录制中"></span> <span id="recording-text">IDLE</span></div>
+          <div class="summary-sub">自动会话记录</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Robot</div>
+          <div class="summary-value"><span class="conn-dot" id="dot-robot" title="机械臂"></span> <span id="robot-status">offline</span></div>
+          <div class="summary-sub">硬件连通性</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Policy Server</div>
+          <div class="summary-value"><span class="conn-dot" id="dot-server" title="推理服务"></span> <span id="server-status">offline</span></div>
+          <div class="summary-sub">推理链路</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel prompt-panel">
+      <div>
+        <div class="prompt-label">Current Prompt</div>
+        <div class="prompt-current" id="prompt-current">--</div>
+      </div>
+      <div class="prompt-row">
+        <input id="prompt-input" type="text" placeholder="输入语言指令..." value="pick up the bottle and put it into the box">
+        <button id="btn-send-prompt" onclick="sendPrompt()">发送指令</button>
+      </div>
+      <div class="controls">
+        <button id="btn-start" onclick="cmd('start')">推理</button>
+        <button id="btn-stop" onclick="cmd('stop')">停止</button>
+        <button id="btn-home" onclick="cmd('home')">复位</button>
+      </div>
+      <div class="conn-row">
+        <div class="conn-chip">Robot <span class="conn-dot" id="dot-robot-chip"></span></div>
+        <div class="conn-chip">Server <span class="conn-dot" id="dot-server-chip"></span></div>
+      </div>
+    </div>
   </div>
-  <div class="cam-box">
-    <label>腕部相机 (cam2)</label>
-    <img id="img2" alt="cam2">
+
+  <div class="main-grid">
+    <div class="panel camera-panel">
+      <div class="cam-box camera-main">
+        <label>External Camera</label>
+        <img id="img1" alt="cam1">
+        <div class="camera-overlay">
+          <div class="overlay-chip">Controller: <span id="overlay-state">idle</span></div>
+          <div class="overlay-chip">Prompt: <span id="overlay-prompt">--</span></div>
+        </div>
+      </div>
+      <div class="cam-stack">
+        <div class="cam-box">
+          <label>Wrist Camera</label>
+          <img id="img2" alt="cam2">
+        </div>
+        <div class="tele-box">
+          <label>Loop Timing</label>
+          <div class="tele-row"><span class="tele-key">Infer</span><span class="tele-val" id="tele-infer-ms">--</span></div>
+          <div class="tele-row"><span class="tele-key">Total</span><span class="tele-val" id="tele-total-ms">--</span></div>
+          <div class="tele-row"><span class="tele-key">Status</span><span class="tele-val" id="tele-loop-health">--</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel metrics-panel">
+      <div>
+        <div class="metrics-title">Action + Target</div>
+        <div class="metric-grid">
+          <div class="metric-card">
+            <div class="summary-label">Raw Action</div>
+            <div class="tele-row"><span class="tele-key">dpos</span><span class="tele-val" id="tele-action-pos-mag">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot</span><span class="tele-val" id="tele-action-rot-mag">--</span></div>
+            <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-agrip">--</span></div>
+          </div>
+          <div class="metric-card">
+            <div class="summary-label">Transformed Action</div>
+            <div class="tele-row"><span class="tele-key">dpos</span><span class="tele-val" id="tele-action-pos-mag-t">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot</span><span class="tele-val" id="tele-action-rot-mag-t">--</span></div>
+            <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-tagrip">--</span></div>
+          </div>
+          <div class="metric-card" id="loop-card">
+            <div class="summary-label">Execution Window</div>
+            <div class="metric-value" id="loop-total-ms">--</div>
+            <div class="metric-sub">目标 100.0 ms</div>
+          </div>
+          <div class="metric-card">
+            <div class="summary-label">Target Pose</div>
+            <div class="tele-row"><span class="tele-key">pos norm</span><span class="tele-val" id="tele-target-pos-mag">--</span></div>
+            <div class="tele-row"><span class="tele-key">rot norm</span><span class="tele-val" id="tele-target-rot-mag">--</span></div>
+            <div class="tele-row"><span class="tele-key">connected</span><span class="tele-val" id="tele-target-status">--</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
-</div>
 
-<div class="prompt-row">
-  <input id="prompt-input" type="text" placeholder="输入语言指令..." value="pick up the bottle and put it into the box">
-  <button id="btn-send-prompt" onclick="sendPrompt()">发送指令</button>
-</div>
-
-<div class="controls">
-  <button id="btn-start"       onclick="cmd('start')">推理</button>
-  <button id="btn-stop"        onclick="cmd('stop')">停止</button>
-  <button id="btn-home"        onclick="cmd('home')">复位</button>
-</div>
-
-<div class="status-bar">
-  状态：<span id="state-badge" class="state-idle">idle</span>
-  <span id="rec-indicator" title="录屏中"></span>
-  <span class="conn-label">机械臂<span id="dot-robot" class="conn-dot" title="机械臂"></span></span>
-  <span class="conn-label">推理服务<span id="dot-server" class="conn-dot" title="推理服务"></span></span>
-</div>
-
-<div class="telemetry">
-  <div class="tele-box" id="tele-state-box" style="display:none">
-    <label>State（机械臂）</label>
+  <div class="telemetry-section">
+    <div class="section-title">Robot Diagnostics</div>
+    <div class="telemetry">
+      <div class="tele-box" id="tele-state-box" style="display:none">
+        <label>EEF State</label>
     <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-pos-x">—</span></div>
     <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-pos-y">—</span></div>
     <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-pos-z">—</span></div>
@@ -109,8 +389,9 @@
     <div class="tele-row"><span class="tele-key">finger1</span><span class="tele-val" id="tele-grip1">—</span></div>
     <div class="tele-row"><span class="tele-key">finger2</span><span class="tele-val" id="tele-grip2">—</span></div>
   </div>
-  <div class="tele-box" id="tele-joint-box" style="display:none">
-    <label>Joints（关节角度）</label>
+      </div>
+      <div class="tele-box" id="tele-joint-box" style="display:none">
+        <label>Joint State</label>
     <div class="tele-row"><span class="tele-key">q1</span><span class="tele-val" id="tele-q1">—</span></div>
     <div class="tele-row"><span class="tele-key">q2</span><span class="tele-val" id="tele-q2">—</span></div>
     <div class="tele-row"><span class="tele-key">q3</span><span class="tele-val" id="tele-q3">—</span></div>
@@ -118,35 +399,50 @@
     <div class="tele-row"><span class="tele-key">q5</span><span class="tele-val" id="tele-q5">—</span></div>
     <div class="tele-row"><span class="tele-key">q6</span><span class="tele-val" id="tele-q6">—</span></div>
     <div class="tele-row"><span class="tele-key">q7</span><span class="tele-val" id="tele-q7">—</span></div>
-  </div>
-  <div class="tele-box" id="tele-target-box" style="display:none">
-    <label>Target Pose（指令目标）</label>
+      </div>
+      <div class="tele-box" id="tele-ft-box" style="display:none">
+        <label>EE Force / Torque</label>
+        <div class="tele-row"><span class="tele-key">Fx</span><span class="tele-val" id="tele-fx">—</span></div>
+        <div class="tele-row"><span class="tele-key">Fy</span><span class="tele-val" id="tele-fy">—</span></div>
+        <div class="tele-row"><span class="tele-key">Fz</span><span class="tele-val" id="tele-fz">—</span></div>
+        <div class="tele-row"><span class="tele-key">Tx</span><span class="tele-val" id="tele-tx">—</span></div>
+        <div class="tele-row"><span class="tele-key">Ty</span><span class="tele-val" id="tele-ty">—</span></div>
+        <div class="tele-row"><span class="tele-key">Tz</span><span class="tele-val" id="tele-tz">—</span></div>
+      </div>
+    </div>
+
+    <div class="section-title">Command Details</div>
+    <div class="telemetry">
+      <div class="tele-box" id="tele-target-box" style="display:none">
+        <label>Commanded Target Pose</label>
     <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-tpos-x">—</span></div>
     <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-tpos-y">—</span></div>
     <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-tpos-z">—</span></div>
     <div class="tele-row"><span class="tele-key">rot ax</span><span class="tele-val" id="tele-trot-x">—</span></div>
     <div class="tele-row"><span class="tele-key">rot ay</span><span class="tele-val" id="tele-trot-y">—</span></div>
     <div class="tele-row"><span class="tele-key">rot az</span><span class="tele-val" id="tele-trot-z">—</span></div>
-  </div>
-  <div class="tele-box" id="tele-action-box" style="display:none">
-    <label>Action（原始输出）</label>
+      </div>
+      <div class="tele-box" id="tele-action-box" style="display:none">
+        <label>Raw Action</label>
     <div class="tele-row"><span class="tele-key">Δpos x</span><span class="tele-val" id="tele-apos-x">—</span></div>
     <div class="tele-row"><span class="tele-key">Δpos y</span><span class="tele-val" id="tele-apos-y">—</span></div>
     <div class="tele-row"><span class="tele-key">Δpos z</span><span class="tele-val" id="tele-apos-z">—</span></div>
     <div class="tele-row"><span class="tele-key">Δrot ax</span><span class="tele-val" id="tele-arot-x">—</span></div>
     <div class="tele-row"><span class="tele-key">Δrot ay</span><span class="tele-val" id="tele-arot-y">—</span></div>
     <div class="tele-row"><span class="tele-key">Δrot az</span><span class="tele-val" id="tele-arot-z">—</span></div>
-    <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-agrip">—</span></div>
-    <label style="margin-top:6px">Action（变换后）</label>
+        <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-agrip-detail">—</span></div>
+      </div>
+      <div class="tele-box" id="tele-action-t-box" style="display:none">
+        <label>Transformed Action</label>
     <div class="tele-row"><span class="tele-key">Δpos x</span><span class="tele-val" id="tele-tapos-x">—</span></div>
     <div class="tele-row"><span class="tele-key">Δpos y</span><span class="tele-val" id="tele-tapos-y">—</span></div>
     <div class="tele-row"><span class="tele-key">Δpos z</span><span class="tele-val" id="tele-tapos-z">—</span></div>
     <div class="tele-row"><span class="tele-key">Δrot ax</span><span class="tele-val" id="tele-tarot-x">—</span></div>
     <div class="tele-row"><span class="tele-key">Δrot ay</span><span class="tele-val" id="tele-tarot-y">—</span></div>
     <div class="tele-row"><span class="tele-key">Δrot az</span><span class="tele-val" id="tele-tarot-z">—</span></div>
-    <div class="tele-row"><span class="tele-key">gripper target</span><span class="tele-val" id="tele-tagrip">—</span></div>
-    <div class="tele-row"><span class="tele-key">推理耗时</span><span class="tele-val" id="tele-infer-ms">—</span></div>
-    <div class="tele-row"><span class="tele-key">总耗时</span><span class="tele-val" id="tele-total-ms">—</span></div>
+        <div class="tele-row"><span class="tele-key">gripper target</span><span class="tele-val" id="tele-tagrip-detail">—</span></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -157,6 +453,15 @@ const stateBadge = document.getElementById('state-badge');
 const recIndicator = document.getElementById('rec-indicator');
 const dotRobot = document.getElementById('dot-robot');
 const dotServer = document.getElementById('dot-server');
+const dotRobotChip = document.getElementById('dot-robot-chip');
+const dotServerChip = document.getElementById('dot-server-chip');
+const robotStatus = document.getElementById('robot-status');
+const serverStatus = document.getElementById('server-status');
+const recordingText = document.getElementById('recording-text');
+const promptCurrent = document.getElementById('prompt-current');
+const overlayState = document.getElementById('overlay-state');
+const overlayPrompt = document.getElementById('overlay-prompt');
+const loopCard = document.getElementById('loop-card');
 
 // --- WebSocket 图像流 ---
 const ws = new WebSocket(`ws://${location.host}/ws/frames`);
@@ -169,9 +474,7 @@ ws.onmessage = (e) => {
   img2.src = 'data:image/jpeg;base64,' + data.img2;
 
   // 状态量 (State/Connection) 实时更新 (20Hz)
-  if (data.state) updateBadge(data.state);
-  dotRobot.classList.toggle('on', !!data.robot_connected);
-  dotServer.classList.toggle('on', !!data.server_connected);
+  updateHeader(data);
 
   // 数值量 (Telemetry) 节流更新，让肉眼能看清
   const now = Date.now();
@@ -195,12 +498,64 @@ async function sendPrompt() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt }),
   });
+  promptCurrent.textContent = prompt || '--';
+  overlayPrompt.textContent = summarizePrompt(prompt);
 }
 
 // --- 状态轮询 ---
 function updateBadge(state) {
   stateBadge.textContent = state;
-  stateBadge.className = `state-${state}`;
+  stateBadge.className = `state-pill state-${state}`;
+  overlayState.textContent = state || '--';
+}
+
+function summarizePrompt(prompt) {
+  if (!prompt) return '--';
+  return prompt.length > 48 ? prompt.slice(0, 45) + '...' : prompt;
+}
+
+function updateConnection(dot, on) {
+  dot.classList.toggle('on', !!on);
+}
+
+function updateHeader(data) {
+  if (data.controller_state) updateBadge(data.controller_state);
+
+  const recording = !!data.recording;
+  recIndicator.classList.toggle('active', recording);
+  recordingText.textContent = recording ? 'REC' : 'IDLE';
+
+  const prompt = data.prompt ?? '';
+  promptCurrent.textContent = prompt || '--';
+  overlayPrompt.textContent = summarizePrompt(prompt);
+
+  updateConnection(dotRobot, data.robot_connected);
+  updateConnection(dotServer, data.server_connected);
+  updateConnection(dotRobotChip, data.robot_connected);
+  updateConnection(dotServerChip, data.server_connected);
+  robotStatus.textContent = data.robot_connected ? 'online' : 'offline';
+  serverStatus.textContent = data.server_connected ? 'online' : 'offline';
+}
+
+function setText(el, val) {
+  if (!el) return;
+  if (el.textContent === val) return;
+  el.textContent = val;
+}
+
+function setValue(el, val, opts = {}) {
+  if (!el) return;
+  const next = String(val);
+  const changed = el.textContent !== next;
+  el.textContent = next;
+  el.classList.toggle('changed', changed);
+  el.classList.toggle('warn', !!opts.warn);
+  el.classList.toggle('danger', !!opts.danger);
+}
+
+function norm3(arr) {
+  if (!arr || arr.length < 3) return null;
+  return Math.sqrt(arr[0] ** 2 + arr[1] ** 2 + arr[2] ** 2);
 }
 
 // --- 元素缓存 ---
@@ -227,6 +582,7 @@ const teleEls = {
   arotY: document.getElementById('tele-arot-y'),
   arotZ: document.getElementById('tele-arot-z'),
   agrip: document.getElementById('tele-agrip'),
+  agripDetail: document.getElementById('tele-agrip-detail'),
   taposX: document.getElementById('tele-tapos-x'),
   taposY: document.getElementById('tele-tapos-y'),
   taposZ: document.getElementById('tele-tapos-z'),
@@ -234,6 +590,7 @@ const teleEls = {
   tarotY: document.getElementById('tele-tarot-y'),
   tarotZ: document.getElementById('tele-tarot-z'),
   tagrip: document.getElementById('tele-tagrip'),
+  tagripDetail: document.getElementById('tele-tagrip-detail'),
   tposX: document.getElementById('tele-tpos-x'),
   tposY: document.getElementById('tele-tpos-y'),
   tposZ: document.getElementById('tele-tpos-z'),
@@ -242,94 +599,134 @@ const teleEls = {
   trotZ: document.getElementById('tele-trot-z'),
   inferMs: document.getElementById('tele-infer-ms'),
   totalMs: document.getElementById('tele-total-ms'),
+  loopHealth: document.getElementById('tele-loop-health'),
+  actionPosMag: document.getElementById('tele-action-pos-mag'),
+  actionRotMag: document.getElementById('tele-action-rot-mag'),
+  actionPosMagT: document.getElementById('tele-action-pos-mag-t'),
+  actionRotMagT: document.getElementById('tele-action-rot-mag-t'),
+  targetPosMag: document.getElementById('tele-target-pos-mag'),
+  targetRotMag: document.getElementById('tele-target-rot-mag'),
+  targetStatus: document.getElementById('tele-target-status'),
+  loopTotalMs: document.getElementById('loop-total-ms'),
+  fx: document.getElementById('tele-fx'),
+  fy: document.getElementById('tele-fy'),
+  fz: document.getElementById('tele-fz'),
+  tx: document.getElementById('tele-tx'),
+  ty: document.getElementById('tele-ty'),
+  tz: document.getElementById('tele-tz'),
   stateBox: document.getElementById('tele-state-box'),
   jointBox: document.getElementById('tele-joint-box'),
   targetBox: document.getElementById('tele-target-box'),
-  actionBox: document.getElementById('tele-action-box')
+  ftBox: document.getElementById('tele-ft-box'),
+  actionBox: document.getElementById('tele-action-box'),
+  actionTBox: document.getElementById('tele-action-t-box')
 };
 
 function updateTelemetry(data) {
   const fmt = (v) => v.toFixed(4);
-  const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
+  const fmtMs = (v) => v.toFixed(1) + ' ms';
+  const rawPosNorm = norm3(data.action_raw ? data.action_raw.slice(0, 3) : null);
+  const rawRotNorm = norm3(data.action_raw ? data.action_raw.slice(3, 6) : null);
+  const tfPosNorm = norm3(data.action_transformed ? data.action_transformed.slice(0, 3) : null);
+  const tfRotNorm = norm3(data.action_transformed ? data.action_transformed.slice(3, 6) : null);
+  const tgtPosNorm = norm3(data.target_pose ? data.target_pose.slice(0, 3) : null);
+  const tgtRotNorm = norm3(data.target_pose ? data.target_pose.slice(3, 6) : null);
+  const totalMs = data.total_ms;
+  const overBudget = totalMs != null && totalMs > 100.0;
 
   teleEls.stateBox.style.display = data.robot_connected ? '' : 'none';
   teleEls.jointBox.style.display = data.robot_connected ? '' : 'none';
-  if (teleEls.targetBox) teleEls.targetBox.style.display = (data.robot_connected && data.state === 'running') ? '' : 'none';
+  teleEls.ftBox.style.display = data.robot_connected && data.ee_force_torque ? '' : 'none';
+  if (teleEls.targetBox) teleEls.targetBox.style.display = (data.robot_connected && data.controller_state === 'running') ? '' : 'none';
   teleEls.actionBox.style.display = data.server_connected ? '' : 'none';
+  teleEls.actionTBox.style.display = data.server_connected ? '' : 'none';
 
-  if (data.robot_connected && data.latest_state) {
-    const s = data.latest_state;
-    set(teleEls.posX, fmt(s[0]));
-    set(teleEls.posY, fmt(s[1]));
-    set(teleEls.posZ, fmt(s[2]));
-    set(teleEls.rotX, fmt(s[3]));
-    set(teleEls.rotY, fmt(s[4]));
-    set(teleEls.rotZ, fmt(s[5]));
-    set(teleEls.grip1, fmt(s[6]));
-    set(teleEls.grip2, fmt(s[7]));
+  if (data.robot_connected && data.state) {
+    const s = data.state;
+    setValue(teleEls.posX, fmt(s[0]));
+    setValue(teleEls.posY, fmt(s[1]));
+    setValue(teleEls.posZ, fmt(s[2]));
+    setValue(teleEls.rotX, fmt(s[3]));
+    setValue(teleEls.rotY, fmt(s[4]));
+    setValue(teleEls.rotZ, fmt(s[5]));
+    setValue(teleEls.grip1, fmt(s[6]));
+    setValue(teleEls.grip2, fmt(s[7]));
   }
-  if (data.robot_connected && data.latest_joints) {
-    const q = data.latest_joints;
-    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
-    set(teleEls.q1, fmt(q[0]));
-    set(teleEls.q2, fmt(q[1]));
-    set(teleEls.q3, fmt(q[2]));
-    set(teleEls.q4, fmt(q[3]));
-    set(teleEls.q5, fmt(q[4]));
-    set(teleEls.q6, fmt(q[5]));
-    set(teleEls.q7, fmt(q[6]));
+  if (data.robot_connected && data.joint_state) {
+    const q = data.joint_state;
+    setValue(teleEls.q1, fmt(q[0]));
+    setValue(teleEls.q2, fmt(q[1]));
+    setValue(teleEls.q3, fmt(q[2]));
+    setValue(teleEls.q4, fmt(q[3]));
+    setValue(teleEls.q5, fmt(q[4]));
+    setValue(teleEls.q6, fmt(q[5]));
+    setValue(teleEls.q7, fmt(q[6]));
   }
-  if (data.robot_connected && data.latest_target_pose) {
-    const tp = data.latest_target_pose;
-    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
-    set(teleEls.tposX, fmt(tp[0]));
-    set(teleEls.tposY, fmt(tp[1]));
-    set(teleEls.tposZ, fmt(tp[2]));
-    set(teleEls.trotX, fmt(tp[3]));
-    set(teleEls.trotY, fmt(tp[4]));
-    set(teleEls.trotZ, fmt(tp[5]));
+  if (data.robot_connected && data.ee_force_torque) {
+    const ft = data.ee_force_torque;
+    setValue(teleEls.fx, fmt(ft[0]));
+    setValue(teleEls.fy, fmt(ft[1]));
+    setValue(teleEls.fz, fmt(ft[2]));
+    setValue(teleEls.tx, fmt(ft[3]));
+    setValue(teleEls.ty, fmt(ft[4]));
+    setValue(teleEls.tz, fmt(ft[5]));
   }
-  if (data.server_connected && data.latest_action) {
-    const a = data.latest_action;
-    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
-    set(teleEls.aposX, fmt(a[0]));
-    set(teleEls.aposY, fmt(a[1]));
-    set(teleEls.aposZ, fmt(a[2]));
-    set(teleEls.arotX, fmt(a[3]));
-    set(teleEls.arotY, fmt(a[4]));
-    set(teleEls.arotZ, fmt(a[5]));
-    set(teleEls.agrip, fmt(a[6]));
+  if (data.robot_connected && data.target_pose) {
+    const tp = data.target_pose;
+    setValue(teleEls.tposX, fmt(tp[0]));
+    setValue(teleEls.tposY, fmt(tp[1]));
+    setValue(teleEls.tposZ, fmt(tp[2]));
+    setValue(teleEls.trotX, fmt(tp[3]));
+    setValue(teleEls.trotY, fmt(tp[4]));
+    setValue(teleEls.trotZ, fmt(tp[5]));
   }
-  if (data.server_connected && data.latest_action_transformed) {
-    const ta = data.latest_action_transformed;
-    const set = (el, val) => { if (el.textContent !== val) el.textContent = val; };
-    set(teleEls.taposX, fmt(ta[0]));
-    set(teleEls.taposY, fmt(ta[1]));
-    set(teleEls.taposZ, fmt(ta[2]));
-    set(teleEls.tarotX, fmt(ta[3]));
-    set(teleEls.tarotY, fmt(ta[4]));
-    set(teleEls.tarotZ, fmt(ta[5]));
-    set(teleEls.tagrip, (ta[6] > 0.04 ? 'OPEN' : 'CLOSE'));
+  if (data.server_connected && data.action_raw) {
+    const a = data.action_raw;
+    setValue(teleEls.aposX, fmt(a[0]), { warn: Math.abs(a[0]) > 0.01 });
+    setValue(teleEls.aposY, fmt(a[1]), { warn: Math.abs(a[1]) > 0.01 });
+    setValue(teleEls.aposZ, fmt(a[2]), { warn: Math.abs(a[2]) > 0.01 });
+    setValue(teleEls.arotX, fmt(a[3]), { warn: Math.abs(a[3]) > 0.05 });
+    setValue(teleEls.arotY, fmt(a[4]), { warn: Math.abs(a[4]) > 0.05 });
+    setValue(teleEls.arotZ, fmt(a[5]), { warn: Math.abs(a[5]) > 0.05 });
+    const gripLabel = a[6] >= 0 ? 'CLOSE' : 'OPEN';
+    setValue(teleEls.agrip, gripLabel);
+    setValue(teleEls.agripDetail, gripLabel);
+  }
+  if (data.server_connected && data.action_transformed) {
+    const ta = data.action_transformed;
+    setValue(teleEls.taposX, fmt(ta[0]));
+    setValue(teleEls.taposY, fmt(ta[1]));
+    setValue(teleEls.taposZ, fmt(ta[2]));
+    setValue(teleEls.tarotX, fmt(ta[3]));
+    setValue(teleEls.tarotY, fmt(ta[4]));
+    setValue(teleEls.tarotZ, fmt(ta[5]));
+    const gripTarget = ta[6] > 0.04 ? 'OPEN' : 'CLOSE';
+    setValue(teleEls.tagrip, gripTarget);
+    setValue(teleEls.tagripDetail, gripTarget);
   }
   if (data.infer_ms != null) {
-    teleEls.inferMs.textContent = data.infer_ms.toFixed(1) + ' ms';
+    setValue(teleEls.inferMs, fmtMs(data.infer_ms), { warn: data.infer_ms > 70.0 });
   }
-  if (data.prev_total_ms != null) {
-    teleEls.totalMs.textContent = data.prev_total_ms.toFixed(1) + ' ms';
+  if (data.total_ms != null) {
+    setValue(teleEls.totalMs, fmtMs(data.total_ms), { warn: data.total_ms > 100.0, danger: data.total_ms > 130.0 });
+    setValue(teleEls.loopTotalMs, fmtMs(data.total_ms), { warn: overBudget, danger: data.total_ms > 130.0 });
+    setValue(teleEls.loopHealth, overBudget ? 'over budget' : 'stable', { warn: overBudget, danger: data.total_ms > 130.0 });
   }
+
+  setValue(teleEls.actionPosMag, rawPosNorm != null ? fmt(rawPosNorm) : '--');
+  setValue(teleEls.actionRotMag, rawRotNorm != null ? fmt(rawRotNorm) : '--');
+  setValue(teleEls.actionPosMagT, tfPosNorm != null ? fmt(tfPosNorm) : '--');
+  setValue(teleEls.actionRotMagT, tfRotNorm != null ? fmt(tfRotNorm) : '--');
+  setValue(teleEls.targetPosMag, tgtPosNorm != null ? fmt(tgtPosNorm) : '--');
+  setValue(teleEls.targetRotMag, tgtRotNorm != null ? fmt(tgtRotNorm) : '--');
+  setValue(teleEls.targetStatus, data.robot_connected ? 'tracking' : 'offline');
+  loopCard.classList.toggle('warn', overBudget);
 }
 
 async function pollStatus() {
   const res = await fetch('/status');
   const data = await res.json();
-  updateBadge(data.state);
-  if (data.recording) {
-    recIndicator.classList.add('active');
-  } else {
-    recIndicator.classList.remove('active');
-  }
-  dotRobot.classList.toggle('on', !!data.robot_connected);
-  dotServer.classList.toggle('on', !!data.server_connected);
+  updateHeader(data);
 
   // 如果 WS 没开，则由轮询驱动数据更新
   if (ws.readyState !== WebSocket.OPEN) {

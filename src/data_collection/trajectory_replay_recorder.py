@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-按已采集的 CSV 轨迹回放机械臂，并将 replay 时的 state/action 记录到新 CSV。
-
-输出格式与 data_recorder.py 保持一致：
-    第 1 行: JSON 元信息
-    第 2 行: CSV 表头
-    第 3 行起: state_0..7 + action_0..6
+按已采集的 JSON 轨迹回放机械臂，并将 replay 时的 state/joint_state/action 记录到新 JSON。
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import pathlib
@@ -32,29 +26,17 @@ DEFAULT_CAM1_SERIAL = "346222072769"
 DEFAULT_CAM2_SERIAL = "938422075745"
 
 
-def _load_episode_csv(csv_path: pathlib.Path) -> tuple[dict, list[dict[str, list[float]]]]:
-    with open(csv_path, "r", newline="") as f:
-        rows = list(csv.reader(f))
+def _load_episode_json(json_path: pathlib.Path) -> tuple[dict, list[dict[str, list[float]]]]:
+    with open(json_path, "r") as f:
+        payload = json.load(f)
 
-    if len(rows) < 2:
-        raise ValueError(f"CSV 内容不完整: {csv_path}")
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON 顶层必须是对象: {json_path}")
 
-    meta = json.loads(rows[0][0])
-    header = rows[1]
-    expected_header = [f"state_{i}" for i in range(8)] + [f"action_{i}" for i in range(7)]
-    if header != expected_header:
-        raise ValueError(f"CSV 表头不匹配: {csv_path}")
-
-    samples: list[dict[str, list[float]]] = []
-    for idx, row in enumerate(rows[2:], start=3):
-        if not row:
-            continue
-        if len(row) != 15:
-            raise ValueError(f"CSV 第 {idx} 行字段数错误，期望 15，实际 {len(row)}")
-        values = [float(x) for x in row]
-        samples.append({"state": values[:8], "action": values[8:]})
-
-    return meta, samples
+    samples = payload.get("frames")
+    if not isinstance(samples, list):
+        raise ValueError(f"JSON 缺少 frames 数组: {json_path}")
+    return payload, samples
 
 
 def _resolve_episode_dir(args: argparse.Namespace) -> pathlib.Path:
@@ -67,8 +49,8 @@ def _resolve_episode_dir(args: argparse.Namespace) -> pathlib.Path:
 
     if not episode_dir.is_dir():
         raise FileNotFoundError(f"episode 目录不存在: {episode_dir}")
-    if not (episode_dir / "data.csv").is_file():
-        raise FileNotFoundError(f"未找到 data.csv: {episode_dir / 'data.csv'}")
+    if not (episode_dir / "data.json").is_file():
+        raise FileNotFoundError(f"未找到 data.json: {episode_dir / 'data.json'}")
     return episode_dir
 
 
@@ -91,20 +73,15 @@ def _default_output_dir(episode_dir: pathlib.Path) -> pathlib.Path:
         index += 1
 
 
-def _save_csv(
+def _save_json(
     output_dir: pathlib.Path,
-    meta: dict,
-    rows: list[dict[str, list[float]]],
+    payload: dict,
 ) -> pathlib.Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "data.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([json.dumps(meta, ensure_ascii=False)])
-        writer.writerow([f"state_{i}" for i in range(8)] + [f"action_{i}" for i in range(7)])
-        for row in rows:
-            writer.writerow(row["state"] + row["action"])
-    return csv_path
+    json_path = output_dir / "data.json"
+    with open(json_path, "w") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return json_path
 
 
 class TrajectoryReplayRecorder:
@@ -121,8 +98,9 @@ class TrajectoryReplayRecorder:
     ):
         self.episode_dir = episode_dir
         self.output_dir = output_dir
-        self.source_csv = episode_dir / "data.csv"
-        self.source_meta, self.samples = _load_episode_csv(self.source_csv)
+        self.source_json = episode_dir / "data.json"
+        self.source_meta, self.samples = _load_episode_json(self.source_json)
+        self.action_scale = float(self.source_meta.get("action_scale", 100.0))
 
         source_hz = float(self.source_meta.get("collect_hz", 10.0))
         if replay_hz is not None:
@@ -155,11 +133,13 @@ class TrajectoryReplayRecorder:
     def _record_sample(self, sample: dict[str, list[float]]):
         obs, _, _ = self.env.get_observation(self.prompt)
         state = obs["observation/state"].astype(np.float64).tolist()
-        action = np.asarray(sample["action"], dtype=np.float64)
+        joint_state = obs["observation/joints"].astype(np.float64).tolist()
+        action = np.asarray(sample["action"], dtype=np.float64) / self.action_scale
         self.logged_rows.append(
             {
                 "state": state,
-                "action": action.tolist(),
+                "joint_state": joint_state,
+                "action": (action * self.action_scale).tolist(),
             }
         )
         self.env.enqueue_action(action, transform=False)
@@ -169,19 +149,22 @@ class TrajectoryReplayRecorder:
         if remaining > 0:
             time.sleep(remaining)
 
-    def _build_output_meta(self) -> dict:
+    def _build_output_payload(self) -> dict:
         return {
             "task_name": self.output_dir.name,
             "collect_hz": self.replay_hz,
             "max_frames": len(self.logged_rows),
             "num_frames": len(self.logged_rows),
+            "action_scale": self.action_scale,
+            "prompt": self.prompt,
             "source_episode": str(self.episode_dir),
-            "source_csv": str(self.source_csv),
+            "source_json": str(self.source_json),
             "speed_factor": self.speed,
+            "frames": self.logged_rows,
         }
 
     def run(self):
-        logging.info("加载轨迹: %s", self.source_csv)
+        logging.info("加载轨迹: %s", self.source_json)
         logging.info("源轨迹帧数: %d", len(self.samples))
         logging.info("源频率: %.3f Hz, 回放频率: %.3f Hz", self.source_meta.get("collect_hz", 10.0), self.replay_hz)
         if abs(self.dt - CONTROL_DT) > 1e-6:
@@ -205,23 +188,23 @@ class TrajectoryReplayRecorder:
         finally:
             self.env.stop()
 
-        meta = self._build_output_meta()
-        csv_path = _save_csv(self.output_dir, meta, self.logged_rows)
-        logging.info("replay 记录已保存: %s", csv_path)
+        payload = self._build_output_payload()
+        json_path = _save_json(self.output_dir, payload)
+        logging.info("replay 记录已保存: %s", json_path)
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="按 CSV 回放轨迹并记录 replay state/action")
+    parser = argparse.ArgumentParser(description="按 JSON 回放轨迹并记录 replay state/joint_state/action")
     parser.add_argument("--episode", default=None, help="源 episode 目录，例如 collected/simple_pick_place/epo_21")
     parser.add_argument("--task", default=None, help="任务名，与 --epo 配合使用")
     parser.add_argument("--epo", type=int, default=None, help="episode 编号，与 --task 配合使用")
     parser.add_argument("--output_dir", default=None, help="输出目录，默认自动生成 replay_epo_x")
-    parser.add_argument("--replay_hz", type=float, default=None, help="回放与记录频率，默认使用源 CSV 的 collect_hz * speed")
+    parser.add_argument("--replay_hz", type=float, default=None, help="回放与记录频率，默认使用源 JSON 的 collect_hz * speed")
     parser.add_argument("--speed", type=float, default=1.0, help="速度倍率，仅在未显式设置 --replay_hz 时生效")
-    parser.add_argument("--prompt", default="trajectory replay", help="传给 FrankaEnv.get_observation 的 prompt")
+    parser.add_argument("--prompt", default="", help="传给 FrankaEnv.get_observation 的 prompt")
     parser.add_argument("--cam1_serial", default=DEFAULT_CAM1_SERIAL)
     parser.add_argument("--cam2_serial", default=DEFAULT_CAM2_SERIAL)
-    parser.add_argument("--no_robot", action="store_true", help="无机械臂模式，仅用于联调 CSV 流程")
+    parser.add_argument("--no_robot", action="store_true", help="无机械臂模式，仅用于联调 JSON 流程")
     return parser
 
 

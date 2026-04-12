@@ -196,8 +196,9 @@ class Coordinator:
         logger.info("Control loop started (skill thread running at 10Hz)")
 
         last_state = State.IDLE
+        next_tick = time.perf_counter()
         while True:
-            t_start = time.time()
+            t_start = time.perf_counter()
             with self._state_lock:
                 current_state = self._state
 
@@ -209,12 +210,14 @@ class Coordinator:
             except Exception as e:
                 logger.error(f"Control loop error: {e}", exc_info=True)
 
-            elapsed = time.time() - t_start
-            sleep_time = dt - elapsed
+            next_tick += dt
+            now = time.perf_counter()
+            sleep_time = next_tick - now
             if sleep_time > 0:
                 time.sleep(sleep_time)
             else:
-                logger.warning(f"Control loop overran by {-sleep_time*1000:.1f}ms")
+                logger.warning("Control loop overran by %.1fms", -sleep_time * 1000.0)
+                next_tick = now
 
     def _sync_recording_state(self, current_state: State, last_state: State):
         if current_state == State.RUNNING and last_state != State.RUNNING:
@@ -266,12 +269,15 @@ class Coordinator:
         with self._record_lock:
             if self._recording:
                 relative_time = time.time() - self._record_start_time
+                with self._prompt_lock:
+                    prompt = self._prompt
                 entry = {
                     "timestamp": round(relative_time, 3),
-                    "state": self._state.value,
-                    "observation_state": self._latest_state,
-                    "observation_joints": self._latest_joints,
-                    "commanded_target_pose": self._latest_target_pose,
+                    "controller_state": self._state.value,
+                    "prompt": prompt,
+                    "state": self._latest_state,
+                    "joint_state": self._latest_joints,
+                    "target_pose": self._latest_target_pose,
                     "ee_force_torque": self._latest_ee_force_torque,
                     "action_raw": self._latest_action,
                     "action_transformed": self._latest_action_transformed,
@@ -302,18 +308,23 @@ class Coordinator:
         logger.info("Homing complete, State -> IDLE")
 
     def _build_stream_payload(self, img1_b64: str, img2_b64: str) -> str:
+        with self._prompt_lock:
+            prompt = self._prompt
         payload = {
-            "state": self._state.value,
+            "controller_state": self._state.value,
+            "recording": self._recording,
+            "prompt": prompt,
             "img1": img1_b64,
             "img2": img2_b64,
-            "latest_state": self._latest_state,
-            "latest_joints": self._latest_joints,
-            "latest_target_pose": self._latest_target_pose,
-            "latest_action": self._latest_action,
-            "latest_action_transformed": self._latest_action_transformed,
+            "state": self._latest_state,
+            "joint_state": self._latest_joints,
+            "target_pose": self._latest_target_pose,
+            "ee_force_torque": self._latest_ee_force_torque,
+            "action_raw": self._latest_action,
+            "action_transformed": self._latest_action_transformed,
             "infer_ms": self._latest_infer_ms,
-            "prev_total_ms": self._latest_prev_total_ms,
-            "robot_connected": not self._args.no_robot,
+            "total_ms": self._latest_prev_total_ms,
+            "robot_connected": self._env._fa is not None,
             "server_connected": self._client is not None,
         }
         return json.dumps(payload)
@@ -415,19 +426,25 @@ def build_app(coordinator: Coordinator) -> FastAPI:
     async def status():
         with coordinator._telemetry_lock:
             latest_state = coordinator._latest_state
+            latest_joints = coordinator._latest_joints
+            latest_target_pose = coordinator._latest_target_pose
             latest_action = coordinator._latest_action
+            latest_action_transformed = coordinator._latest_action_transformed
             latest_infer_ms = coordinator._latest_infer_ms
             latest_prev_total_ms = coordinator._latest_prev_total_ms
         return {
-            "state": coordinator.state.value,
+            "controller_state": coordinator.state.value,
             "recording": coordinator._recording,
             "prompt": coordinator._prompt,
             "robot_connected": coordinator._env._fa is not None,
             "server_connected": coordinator._client is not None,
-            "latest_state": latest_state,
-            "latest_action": latest_action,
+            "state": latest_state,
+            "joint_state": latest_joints,
+            "target_pose": latest_target_pose,
+            "action_raw": latest_action,
+            "action_transformed": latest_action_transformed,
             "infer_ms": latest_infer_ms,
-            "prev_total_ms": latest_prev_total_ms,
+            "total_ms": latest_prev_total_ms,
         }
 
     @app.websocket("/ws/frames")

@@ -169,61 +169,50 @@ RESIZE = 224
 
 
 def normalize_rotvec(rotvec: np.ndarray) -> np.ndarray:
-    """规范化旋转矢量到 [-π, π] 范围，并处理奇异性保持连续性。
-    
-    旋转矢量表示的奇异性问题：
-    - 当旋转角度接近 ±π 时，旋转方向可能发生突变
-    - 当旋转角度为 0 或 2π 时，表示不唯一
-    
-    处理方法：
-    1. 将角度规范化到 [-π, π] 范围
-    2. 检测并修复角度跳变（unwrap），保持旋转连续性
+    """对单帧 rotvec 做规范化。
+
+    这个函数只做单帧 canonicalization：
+    - 保持旋转轴方向不变
+    - 将旋转角度折叠到 [-pi, pi]
+
+    它不依赖历史帧，因此不负责跨帧连续性。若需要尽量避免相邻帧在
+    ±pi 附近发生跳变，应使用 normalize_rotvec_with_history()。
     """
     rotvec = np.asarray(rotvec, dtype=np.float64).copy()
-    
-    # 计算旋转角度（标量）
+
     angle = np.linalg.norm(rotvec)
-    
+
     if angle < 1e-6:
-        # 角度接近0，返回零向量
         return rotvec
-    
-    # 轴向
+
     axis = rotvec / angle
-    
-    # 规范化角度到 [-π, π]
-    angle = np.angle(np.exp(1j * angle))  # 等价于 angle % (2*π) 然后移到 [-π, π]
-    
-    # 检查是否需要 unwrap：若与上一次角度差异超过 π，则调整
-    # 这里假设单帧内不会有超过 π 的旋转，因此若出现大跳变则取相反方向
-    if angle > np.pi - 0.1:  # 接近 +π 时，检测是否应取 -π 方向
-        # 检查是否从负值跳变过来，若是从正方向接近 π，可能取反更连续
-        pass  # 具体情况由调用者传入历史状态判断
-    
+    angle = np.angle(np.exp(1j * angle))
     return axis * angle
 
 
 def normalize_rotvec_with_history(rotvec: np.ndarray, prev_rotvec: np.ndarray | None) -> np.ndarray:
-    """带历史信息的旋转矢量规范化，处理奇异性保持连续性。
-    
-    Args:
-        rotvec: 当前旋转矢量
-        prev_rotvec: 上一帧的旋转矢量，若为 None 则使用单帧规范化
+    """在单帧规范化基础上，尽量保持跨帧连续。
+
+    行为分两步：
+    1. 先将当前帧和上一帧都折叠到 [-pi, pi]
+    2. 若发现当前角度相对上一帧跨越了 pi，则通过 +/- 2pi 做 unwrap，
+       让数值表示更接近上一帧
+
+    返回值可能超出 [-pi, pi]，这是有意为之：它牺牲单帧 canonical form，
+    换取时间序列上的平滑性。
     """
     rotvec = np.asarray(rotvec, dtype=np.float64).copy()
-    
+
     if prev_rotvec is None:
         return normalize_rotvec(rotvec)
-    
-    # 计算当前角度和轴向
+
     current_angle = np.linalg.norm(rotvec)
     if current_angle < 1e-6:
         return rotvec
-    
+
     current_axis = rotvec / current_angle
     current_angle = np.angle(np.exp(1j * current_angle))
-    
-    # 计算上一帧角度
+
     prev_angle = np.linalg.norm(prev_rotvec)
     if prev_angle < 1e-6:
         prev_angle = 0.0
@@ -231,25 +220,20 @@ def normalize_rotvec_with_history(rotvec: np.ndarray, prev_rotvec: np.ndarray | 
     else:
         prev_axis = prev_rotvec / prev_angle
         prev_angle = np.angle(np.exp(1j * prev_angle))
-    
-    # 检测轴向是否反转（检测 θ -> -θ + 2π 的跳变）
+
     angle_diff = current_angle - prev_angle
-    
-    # 若角度差超过 π，说明发生了奇异性跳变
+
     if abs(angle_diff) > np.pi:
-        # 调整当前角度以保持连续
         if angle_diff > 0:
             current_angle -= 2 * np.pi
         else:
             current_angle += 2 * np.pi
-    
-    # 检测轴向是否反转（当角度很小时可能需要）
-    if abs(current_angle) < 0.1:  # 角度很小时，检查是否应取相反轴
+
+    if abs(current_angle) < 0.1:
         axis_dot = np.dot(current_axis, prev_axis)
-        if axis_dot < -0.9:  # 轴向几乎相反
-            # 保持上一帧的轴向反转
+        if axis_dot < -0.9:
             return -prev_rotvec
-    
+
     return current_axis * current_angle
 
 
@@ -298,8 +282,8 @@ class FrankaEnv:
         # 末端力矩缓存：[force(3), torque(3)]，单位 [N, Nm]
         self._cached_ee_force_torque: np.ndarray | None = None  # (6,)
         
-        # 旋转矢量历史缓存（用于处理奇异性）
-        self._prev_rotvec: np.ndarray | None = None  # 上一帧的轴角
+        # 旋转矢量历史缓存：存原始 rotvec，供 normalize_rotvec_with_history 做跨帧连续化
+        self._prev_rotvec: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -395,6 +379,20 @@ class FrankaEnv:
             [-half_gripper_width],
         ])
 
+    def get_robot_state_vector(self) -> np.ndarray:
+        """返回当前机器人 state 向量，格式与 observation/state 一致。"""
+        if self._fa is None:
+            return np.zeros(8, dtype=np.float64)
+        pos, rot, _joints, half = self._get_robot_state_for_observation()
+        return self._build_observation_state(pos, rot, half).astype(np.float64)
+
+    def get_joint_state_vector(self) -> np.ndarray:
+        """返回当前机器人关节状态向量，格式与 observation/joints 一致。"""
+        if self._fa is None:
+            return np.zeros(7, dtype=np.float64)
+        _pos, _rot, joints, _half = self._get_robot_state_for_observation()
+        return np.asarray(joints, dtype=np.float64).copy()
+
     def _refresh_robot_cache(self):
         with self._lock:
             actual_pose = self._fa.get_pose()
@@ -467,8 +465,9 @@ class FrankaEnv:
         init_time: float,
         msg_id: int,
     ) -> int:
+        cycle_start = time.perf_counter()
         ts = np.arange(INTERP_DT, CONTROL_DT + INTERP_DT * 0.5, INTERP_DT)
-        for t in ts:
+        for idx, t in enumerate(ts, start=1):
             if self._skill_stop.is_set():
                 break
             w = min_jerk_weight(t, CONTROL_DT)
@@ -496,7 +495,15 @@ class FrankaEnv:
                 ),
             )
             fa.publish_sensor_data(ros_msg)
-            time.sleep(INTERP_DT)
+            deadline = cycle_start + idx * INTERP_DT
+            remaining = deadline - time.perf_counter()
+            if remaining > 0:
+                time.sleep(remaining)
+
+        cycle_deadline = cycle_start + CONTROL_DT
+        remaining = cycle_deadline - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
         return msg_id
 
     def _publish_termination(self, fa: "FrankaArm", init_time: float):

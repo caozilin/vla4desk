@@ -2,7 +2,7 @@
 """
 Franka Panda 数据采集框架
 =========================
-录制状态-动作对，保存为视频 + CSV。
+录制状态-动作对，保存为视频 + JSON。
 
 依赖 key_control.py 提供 state/action 数据源。
 
@@ -17,7 +17,7 @@ Franka Panda 数据采集框架
         epo_1/
             cam1.mp4   外部相机视频
             cam2.mp4   腕部相机视频
-            data.csv   第1行=超参数JSON，第2行=列名，第3行起=数据
+            data.json  元信息 + 逐帧 state/joint_state/action
         epo_2/
             ...
 
@@ -28,7 +28,6 @@ Franka Panda 数据采集框架
 """
 
 import argparse
-import csv
 import json
 import logging
 import pathlib
@@ -125,7 +124,7 @@ class DataRecorder:
 
     # 默认超参数
     COLLECTION_DIR = pathlib.Path(__file__).parent.parent.parent / "collected"
-    TASK_NAME = "simple_pick_place"
+    TASK_NAME = "default"
     COLLECT_HZ = 10.0  # 与 vla_control 保持一致
     MAX_FRAMES = 1000
     ACTION_THRESH_POS = 0.0005    # m
@@ -134,6 +133,8 @@ class DataRecorder:
     STATE_THRESH_ROT = 0.005     # rad
     STATE_THRESH_GRIPPER = 0.0005  # m
     TRAILING_REPEAT_FRAMES = 10
+    ACTION_SCALE = 100.0
+    PROMPT = ""
 
     def __init__(
         self,
@@ -146,6 +147,8 @@ class DataRecorder:
         action_thresh_rot=None,
         cam1_serial=None,
         cam2_serial=None,
+        action_scale=None,
+        prompt=None,
     ):
         self.kc = key_control
 
@@ -156,6 +159,8 @@ class DataRecorder:
         self.collect_hz = collect_hz or self.COLLECT_HZ
         self.max_frames = max_frames if max_frames is not None else self.MAX_FRAMES
         self.dt = 1.0 / self.collect_hz
+        self.action_scale = float(action_scale) if action_scale is not None else self.ACTION_SCALE
+        self.prompt = self.PROMPT if prompt is None else prompt
 
         self.action_thresh_pos = (
             action_thresh_pos if action_thresh_pos is not None
@@ -223,6 +228,7 @@ class DataRecorder:
         """将一段轨迹写入磁盘"""
         if frames1 and data:
             last_state = np.asarray(data[-1]["state"], dtype=np.float64)
+            last_joint_state = np.asarray(data[-1]["joint_state"], dtype=np.float64)
             last_action = np.asarray(data[-1]["action"], dtype=np.float64)
             padded_action = np.zeros_like(last_action)
             padded_action[6] = last_action[6]
@@ -234,6 +240,7 @@ class DataRecorder:
                 frames2.append(last_frame2.copy())
                 data.append({
                     "state": last_state.tolist(),
+                    "joint_state": last_joint_state.tolist(),
                     "action": padded_action.tolist(),
                 })
 
@@ -257,6 +264,9 @@ class DataRecorder:
             collect_hz=self.collect_hz,
             max_frames=self.max_frames,
             num_frames=len(frames1),
+            action_scale=self.action_scale,
+            prompt=self.prompt,
+            frames=data,
         )
 
         # 保存视频
@@ -271,16 +281,11 @@ class DataRecorder:
         except Exception as e:
             logging.error(f"视频保存失败: {e}")
 
-        # 保存 CSV
-        path_csv = epo_dir / "data.csv"
-        with open(path_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([json.dumps(meta, ensure_ascii=False)])
-            w.writerow([f"state_{i}" for i in range(8)] + [f"action_{i}" for i in range(7)])
-            for row in data:
-                w.writerow(row["state"] + row["action"])
+        path_json = epo_dir / "data.json"
+        with open(path_json, "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        print(f"  [保存] CSV: {path_csv} ({len(data)} 帧)")
+        print(f"  [保存] JSON: {path_json} ({len(data)} 帧)")
         self.stats["trajectories_saved"] += 1
         self.stats["total_frames"] += len(data)
         print(f"  [统计] 已保存 {self.stats['trajectories_saved']} 段, "
@@ -350,6 +355,7 @@ class DataRecorder:
 
     def _collect_frame(self):
         state, action = self.kc.get_state_and_action()
+        joint_state = self.kc.env.get_joint_state_vector()
 
         if self._is_action_empty(action) and self._is_state_same_as_last_recorded(state):
             self.stats["skipped_frames"] += 1
@@ -364,7 +370,12 @@ class DataRecorder:
         if recording:
             self.recording_frames1.append(img1.copy())
             self.recording_frames2.append(img2.copy())
-            self.recording_data.append({"state": state.tolist(), "action": action.tolist()})
+            scaled_action = (np.asarray(action, dtype=np.float64) * self.action_scale).tolist()
+            self.recording_data.append({
+                "state": state.tolist(),
+                "joint_state": joint_state.tolist(),
+                "action": scaled_action,
+            })
             self._last_recorded_state = np.asarray(state, dtype=np.float64).copy()
 
             if len(self.recording_frames1) >= self.max_frames:
@@ -414,6 +425,8 @@ def main():
     parser.add_argument("--task_name", default=None)
     parser.add_argument("--collect_hz", type=float, default=None)
     parser.add_argument("--max_frames", type=int, default=None)
+    parser.add_argument("--action_scale", type=float, default=None)
+    parser.add_argument("--prompt", default=None)
     parser.add_argument(
         "--input_device",
         choices=("keyboard", "ps4"),
@@ -437,8 +450,8 @@ def main():
     print("[DEBUG] 启动控制线程...")
     kc.start()
     time.sleep(0.5)
-    print(f"[DEBUG] kc.running={kc.running}, pub_thread={kc._pub_thread}, "
-          f"alive={kc._pub_thread.is_alive() if kc._pub_thread else None}")
+    print(f"[DEBUG] kc.running={kc.running}, input_thread={kc._input_thread}, "
+          f"alive={kc._input_thread.is_alive() if kc._input_thread else None}")
 
     recorder = DataRecorder(
         key_control=kc,
@@ -446,6 +459,8 @@ def main():
         task_name=args.task_name,
         collect_hz=args.collect_hz,
         max_frames=args.max_frames,
+        action_scale=args.action_scale,
+        prompt=args.prompt,
     )
 
     # 采集循环独立线程
