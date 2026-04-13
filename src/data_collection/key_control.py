@@ -282,13 +282,13 @@ class KeyboardController:
             print("  [控制] 键盘模式")
             print("  [控制] W/S:X  A/D:Y  I/K:Z  Q/E:Roll  U/O:Pitch  J/L:Yaw")
             print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
-            print("  [控制] G/H:夹爪  +/-:速度档位  R:复位  1/2:开始/结束录制  ESC:退出")
+            print("  [控制] G/H:夹爪  +/-:速度档位  R:复位  1/2/3:开始/结束/作废录制  ESC:退出")
             return
 
         print("  [控制] PS4 手柄模式")
         print("  [控制] 左摇杆:X/Y平移  右摇杆:Z平移/Yaw  L1/R1:Roll  L2/R2:Pitch")
         print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
-        print("  [控制] 三角/圆圈:打开/关闭夹爪  方块:复位  十字键左右:速度档位")
+        print("  [控制] 三角/圆圈:打开/关闭夹爪  叉:作废并复位  方块:复位  十字键左右:速度档位")
         print("  [控制] L3/R3:开始/结束录制  OPTIONS:退出")
 
     def _emit_event(self, event_name: str):
@@ -372,6 +372,12 @@ class KeyboardController:
                         self.rumble(0.9, 0.9, 260)
                         self.stop()
                         return False
+                    if button_idx == PS4_BUTTON_CROSS:
+                        self.rumble(0.2, 0.75, 90)
+                        self._emit_event("record_discard")
+                        self._open_gripper()
+                        self._reset()
+                        return self.running and not self._stop_event.is_set()
                     if button_idx == PS4_BUTTON_SQUARE:
                         self._reset()
                         return self.running and not self._stop_event.is_set()
@@ -629,21 +635,10 @@ class KeyboardController:
         with self._state_lock:
             return self._latest_state.copy(), self._latest_action.copy()
 
-    def get_recording_snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """返回用于录制的 env 执行快照。
+    def get_recording_snapshot(self) -> dict[str, np.ndarray | int | float]:
+        """返回最近一拍已对齐的 env 控制 trace。"""
+        return self.env.get_latest_control_trace()
 
-        返回值依次为：
-        - state: (8,)
-        - joint_state: (7,)
-        - commanded_pose: (6,)
-        - action: (7,)
-        """
-        state = self.env.get_robot_state_vector()
-        joint_state = self.env.get_joint_state_vector()
-        action, commanded_pose = self.env.get_executed_control_snapshot()
-        return (
-            state.copy(),
-            joint_state.copy(),
-            commanded_pose.copy(),
-            action.copy(),
-        )
+    def get_recording_snapshots_since(self, last_seq_id: int) -> list[dict[str, np.ndarray | int | float]]:
+        """返回所有 seq_id > last_seq_id 的已对齐控制 trace。"""
+        return self.env.get_control_trace_since(last_seq_id)

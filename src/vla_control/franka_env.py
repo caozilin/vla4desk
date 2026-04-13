@@ -17,6 +17,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,16 @@ class ActionTransformConfig:
     rot_clip: float = ROT_CLIP
     pos_max_vel: float = POS_MAX_VEL
     rot_max_vel: float = ROT_MAX_VEL
+
+
+@dataclass
+class ControlTraceSample:
+    seq_id: int
+    timestamp: float
+    state: np.ndarray
+    joint_state: np.ndarray
+    action: np.ndarray
+    commanded_pose: np.ndarray
 
 
 def _apply_action_transform(
@@ -345,6 +356,16 @@ class FrankaEnv:
         # 最近一次被执行线程真正采用的控制快照
         self._executed_action = np.zeros(7, dtype=np.float64)
         self._executed_commanded_pose = np.zeros(6, dtype=np.float64)
+        self._control_trace_seq = 0
+        self._control_trace_history: deque[ControlTraceSample] = deque(maxlen=4096)
+        self._control_trace_sample = ControlTraceSample(
+            seq_id=0,
+            timestamp=0.0,
+            state=np.zeros(8, dtype=np.float64),
+            joint_state=np.zeros(7, dtype=np.float64),
+            action=np.zeros(7, dtype=np.float64),
+            commanded_pose=np.zeros(6, dtype=np.float64),
+        )
 
         # 旋转矢量历史缓存：存原始 rotvec，供 normalize_rotvec_with_history 做跨帧连续化
         self._prev_rotvec: np.ndarray | None = None
@@ -465,6 +486,65 @@ class FrankaEnv:
             [-half_gripper_width],
         ])
 
+    def _build_control_trace_sample(
+        self,
+        *,
+        timestamp: float,
+        state: np.ndarray,
+        joint_state: np.ndarray,
+        action: np.ndarray,
+        commanded_pose: np.ndarray,
+    ) -> ControlTraceSample:
+        return ControlTraceSample(
+            seq_id=0,
+            timestamp=float(timestamp),
+            state=np.asarray(state, dtype=np.float64).copy(),
+            joint_state=np.asarray(joint_state, dtype=np.float64).copy(),
+            action=np.asarray(action, dtype=np.float64).copy(),
+            commanded_pose=np.asarray(commanded_pose, dtype=np.float64).copy(),
+        )
+
+    def _record_control_trace(
+        self,
+        *,
+        timestamp: float,
+        state: np.ndarray,
+        joint_state: np.ndarray,
+        action: np.ndarray,
+        commanded_pose: np.ndarray,
+    ):
+        sample = self._build_control_trace_sample(
+            timestamp=timestamp,
+            state=state,
+            joint_state=joint_state,
+            action=action,
+            commanded_pose=commanded_pose,
+        )
+        with self._lock:
+            self._control_trace_seq += 1
+            sample.seq_id = self._control_trace_seq
+            self._control_trace_sample = sample
+            self._control_trace_history.append(sample)
+
+    def _snapshot_cached_robot_state(self) -> tuple[np.ndarray, np.ndarray]:
+        pos, rot, joints, half = self._get_robot_state_for_observation()
+        return (
+            self._build_observation_state(pos, rot, half).astype(np.float64),
+            np.asarray(joints, dtype=np.float64).copy(),
+        )
+
+    def _apply_delta_to_pose_array(self, pose: np.ndarray, delta: np.ndarray) -> np.ndarray:
+        next_pose = np.asarray(pose, dtype=np.float64).copy()
+        delta = np.asarray(delta, dtype=np.float64)
+        next_pose[:3] += delta[:3]
+
+        angle = np.linalg.norm(delta[3:6])
+        if angle > 1e-6:
+            delta_rot = Rotation.from_rotvec(delta[3:6]).as_matrix()
+            current_rot = Rotation.from_rotvec(next_pose[3:6]).as_matrix()
+            next_pose[3:6] = Rotation.from_matrix(delta_rot @ current_rot).as_rotvec()
+        return next_pose
+
     def get_robot_state_vector(self) -> np.ndarray:
         """返回当前机器人 state 向量，格式与 observation/state 一致。"""
         if self._fa is None:
@@ -517,6 +597,14 @@ class FrankaEnv:
         with self._lock:
             self._executed_commanded_pose = self._commanded_pose_array.copy()
             self._executed_action = np.zeros(7, dtype=np.float64)
+        state, joints = self._snapshot_cached_robot_state()
+        self._record_control_trace(
+            timestamp=0.0,
+            state=state,
+            joint_state=joints,
+            action=np.zeros(7, dtype=np.float64),
+            commanded_pose=self._commanded_pose_array,
+        )
         logger.info("dynamic skill 就绪，开始接收 action")
         return current_pose.copy(), init_time
 
@@ -725,6 +813,7 @@ class FrankaEnv:
 
             while not self._skill_stop.is_set():
                 self._refresh_robot_cache()
+                state, joints = self._snapshot_cached_robot_state()
 
                 action = self._next_action()
                 if action is None and self._skill_stop.is_set():
@@ -737,6 +826,19 @@ class FrankaEnv:
                 if transformed_action is not None:
                     self._set_executed_control_snapshot(raw_action)
                     last_gripper = self._maybe_update_gripper(fa, transformed_action, last_gripper)
+                    trace_action = raw_action
+                else:
+                    trace_action = np.zeros(7, dtype=np.float64)
+
+                with self._fa_api_lock:
+                    trace_timestamp = fa.get_time() - init_time
+                self._record_control_trace(
+                    timestamp=trace_timestamp,
+                    state=state,
+                    joint_state=joints,
+                    action=trace_action,
+                    commanded_pose=self._commanded_pose_array,
+                )
 
                 msg_id = self._publish_interp_pose(
                     fa,
@@ -771,6 +873,30 @@ class FrankaEnv:
         适用于键盘/手柄遥操作，避免控制延迟因 FIFO 积压而固定放大。
         """
         action_arr = np.asarray(action, dtype=np.float64)
+        if self._fa is None:
+            transformed = self.transform_action(action_arr, scale_motion=transform)
+            with self._lock:
+                self._commanded_pose_array = self._apply_delta_to_pose_array(
+                    self._commanded_pose_array,
+                    transformed[:6],
+                )
+                self._executed_action = action_arr.copy()
+                self._executed_commanded_pose = self._commanded_pose_array.copy()
+                next_timestamp = self._control_trace_sample.timestamp + CONTROL_DT
+            half_width = transformed[6] / 2.0
+            state = np.concatenate([
+                self._commanded_pose_array.copy(),
+                [half_width],
+                [-half_width],
+            ]).astype(np.float64)
+            self._record_control_trace(
+                timestamp=next_timestamp,
+                state=state,
+                joint_state=np.zeros(7, dtype=np.float64),
+                action=action_arr,
+                commanded_pose=self._commanded_pose_array,
+            )
+            return
         if latest_only:
             while True:
                 try:
@@ -789,10 +915,42 @@ class FrankaEnv:
     def commanded_pose_array(self) -> np.ndarray:
         return self._commanded_pose_array
 
+    def get_latest_control_trace(self) -> dict[str, np.ndarray | int | float]:
+        """返回最近一拍已对齐的控制 trace。"""
+        with self._lock:
+            sample = self._control_trace_sample
+            return {
+                "seq_id": int(sample.seq_id),
+                "timestamp": float(sample.timestamp),
+                "state": sample.state.copy(),
+                "joint_state": sample.joint_state.copy(),
+                "action": sample.action.copy(),
+                "commanded_pose": sample.commanded_pose.copy(),
+            }
+
+    def get_control_trace_since(self, last_seq_id: int) -> list[dict[str, np.ndarray | int | float]]:
+        """返回所有 seq_id > last_seq_id 的控制 trace。"""
+        with self._lock:
+            samples = [
+                sample for sample in self._control_trace_history
+                if sample.seq_id > last_seq_id
+            ]
+        return [
+            {
+                "seq_id": int(sample.seq_id),
+                "timestamp": float(sample.timestamp),
+                "state": sample.state.copy(),
+                "joint_state": sample.joint_state.copy(),
+                "action": sample.action.copy(),
+                "commanded_pose": sample.commanded_pose.copy(),
+            }
+            for sample in samples
+        ]
+
     def get_executed_control_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
         """返回最近一次被执行线程真正采用的 (action, commanded_pose)。"""
-        with self._lock:
-            return self._executed_action.copy(), self._executed_commanded_pose.copy()
+        trace = self.get_latest_control_trace()
+        return trace["action"], trace["commanded_pose"]
 
     @property
     def ee_force_torque(self) -> np.ndarray:

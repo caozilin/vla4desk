@@ -137,6 +137,7 @@ class TrajectoryReplayRecorder:
         self.logged_rows: list[dict[str, list[float]]] = []
         self.no_robot = no_robot
         self._logged_commanded_pose = np.zeros(6, dtype=np.float64)
+        self._last_trace_seq = 0
         self.env = FrankaEnv(
             cam1_serial=cam1_serial,
             cam2_serial=cam2_serial,
@@ -169,28 +170,40 @@ class TrajectoryReplayRecorder:
         commanded_pose = self.env.commanded_pose_array.copy()
         if not np.allclose(commanded_pose, 0.0):
             self._logged_commanded_pose = commanded_pose.astype(np.float64)
+            latest_trace = self.env.get_latest_control_trace()
+            self._last_trace_seq = int(latest_trace["seq_id"])
             return
 
         state = self.env.get_robot_state_vector().astype(np.float64)
         if not np.allclose(state[:6], 0.0):
             self._logged_commanded_pose = state[:6].copy()
+            latest_trace = self.env.get_latest_control_trace()
+            self._last_trace_seq = int(latest_trace["seq_id"])
             return
 
         self._logged_commanded_pose = commanded_pose.astype(np.float64)
+        latest_trace = self.env.get_latest_control_trace()
+        self._last_trace_seq = int(latest_trace["seq_id"])
 
-    def _record_sample(self, action: np.ndarray):
-        state = self.env.get_robot_state_vector().astype(np.float64).tolist()
-        joint_state = self.env.get_joint_state_vector().astype(np.float64).tolist()
-        executed_action, executed_commanded_pose = self.env.get_executed_control_snapshot()
-        self.logged_rows.append(
-            {
-                "id": len(self.logged_rows),
-                "state": state,
-                "joint_state": joint_state,
-                "action": _encode_action_for_storage(executed_action, self.action_scale),
-                "commanded_pose": executed_commanded_pose.astype(np.float64).tolist(),
-            }
-        )
+    def _record_sample(self):
+        traces = self.env.get_control_trace_since(self._last_trace_seq)
+        for trace in traces:
+            self._last_trace_seq = int(trace["seq_id"])
+            self.logged_rows.append(
+                {
+                    "id": len(self.logged_rows),
+                    "timestamp": round(float(trace["timestamp"]), 6),
+                    "state": np.asarray(trace["state"], dtype=np.float64).tolist(),
+                    "joint_state": np.asarray(trace["joint_state"], dtype=np.float64).tolist(),
+                    "action": _encode_action_for_storage(
+                        np.asarray(trace["action"], dtype=np.float64),
+                        self.action_scale,
+                    ),
+                    "commanded_pose": np.asarray(
+                        trace["commanded_pose"], dtype=np.float64
+                    ).tolist(),
+                }
+            )
 
     def _sleep_until(self, next_tick: float):
         remaining = next_tick - time.monotonic()
@@ -231,7 +244,7 @@ class TrajectoryReplayRecorder:
                 self.env.enqueue_action(action, transform=False)
                 next_tick += self.dt
                 self._sleep_until(next_tick)
-                self._record_sample(action)
+                self._record_sample()
 
                 if index % max(1, int(round(self.replay_hz))) == 0 or index == len(self.samples):
                     logging.info("回放进度: %d / %d", index, len(self.samples))

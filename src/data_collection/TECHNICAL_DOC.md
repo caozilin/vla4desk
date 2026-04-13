@@ -34,7 +34,7 @@ start_data_collector.sh
   - 将输入转换为 action，并通过 `FrankaEnv.enqueue_action(..., transform=False)` 送入执行侧
   - 不直接调用 dynamic skill 接口，避免和 env 的 skill 线程抢占控制面
 - `DataRecorder`
-  - 以 10Hz 采样 `state/action`
+  - 从 `FrankaEnv` 的 10Hz control trace 中提取已对齐的 `timestamp/state/joint_state/action/commanded_pose`
   - 仅在“action 近零且 state 与上一条已录制 state 基本一致”时跳过
   - 在录制开启时缓存图像和数据
   - 保存为 `cam1.mp4`、`cam2.mp4`、`data.json`
@@ -106,6 +106,7 @@ dyaw = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
 - `L2/R2`：`Pitch`
 - `三角`：打开夹爪
 - `圆圈`：关闭夹爪
+- `叉 / Cross`：若正在录制则作废当前轨迹，不落盘；随后打开夹爪并复位
 - `方块`：复位
 - 十字键左右：速度档位减/加
 - `OPTIONS`：退出
@@ -306,6 +307,7 @@ ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
 - 旋转动作维度一致
 - 夹爪动作语义一致
 - 录制频率与执行 action 周期都为 10Hz
+- 录制使用 env skill 线程产出的 control trace，不再分别拼接 `state` 与 `action`
 
 但也要注意：
 
@@ -371,7 +373,7 @@ ACTION_THRESH_ROT = 0.005
 - 键盘模式：`1` 开始，`2` 结束
 - PS4 模式：`L3` 开始，`R3` 结束
 
-采集循环不是“只看 action 非空就记录”，而是同时检查：
+采集循环不是“只看 action 非空就记录”，而是先消费 env 输出的已对齐 control trace，再检查：
 
 ```python
 if self._is_action_empty(action) and self._is_state_same_as_last_recorded(state):
@@ -379,11 +381,21 @@ if self._is_action_empty(action) and self._is_state_same_as_last_recorded(state)
     return
 ```
 
+其中每条 control trace 至少包含：
+
+- `seq_id`
+- `timestamp`
+- `state`
+- `joint_state`
+- `action`
+- `commanded_pose`
+
 这意味着：
 
 - 纯静止帧不会写入 `data.json`
 - 即使 `action` 近零，只要当前 `state` 与上一条已录制样本有明显差异，仍然会记录
 - 当前 `_is_action_empty()` 仍然不检查 `action[6]`，所以夹爪-only 的过滤行为最终还取决于 `state` 是否变化
+- `state/action/commanded_pose` 来自同一条底层 control trace，不再存在上层分别取样导致的一拍错位
 
 ---
 
@@ -425,6 +437,7 @@ episode 编号按 `epo_N` 自动递增。
   "prompt": "",
   "frames": [
     {
+      "timestamp": 0.1,
       "state": [...],
       "joint_state": [...],
       "action": [...],
@@ -436,6 +449,7 @@ episode 编号按 `epo_N` 自动递增。
 
 逐帧字段：
 
+- `timestamp`: 控制线程时间戳，单位秒
 - `state`: `(8,)`
 - `joint_state`: `(7,)`
 - `action`: `(7,)`

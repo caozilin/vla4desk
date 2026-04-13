@@ -24,6 +24,7 @@ Franka Panda 数据采集框架
 按键：
     1   开始录制一段轨迹
     2   结束当前轨迹（保存）
+    3   作废当前轨迹，打开夹爪并复位
     ESC 退出（自动保存未完成轨迹）
 """
 
@@ -124,6 +125,7 @@ class DataRecorder:
         self._exited = False  # 防止 _on_exit 被多次调用
         self._last_recorded_state: np.ndarray | None = None
         self._gripper_force_record_frames = 0
+        self._last_trace_seq = 0
 
     def _scale_action_for_storage(self, action: np.ndarray) -> list[float]:
         """仅缩放位姿维度，夹爪命令保持 -1/1 原值。"""
@@ -146,6 +148,8 @@ class DataRecorder:
             self.recording_frames2.clear()
             self.recording_data.clear()
             self._last_recorded_state = None
+            latest_trace = self.kc.get_recording_snapshot()
+            self._last_trace_seq = int(latest_trace["seq_id"])
         self.kc.rumble(0.15, 0.85, 120)
         print("  [录制] 开始 → 按 2 结束当前轨迹")
 
@@ -166,6 +170,25 @@ class DataRecorder:
         if frames1:
             self._save_trajectory(frames1, frames2, data)
 
+    def discard_recording(self):
+        """作废当前轨迹，不落盘。"""
+        with self.record_lock:
+            if not self.is_recording:
+                print("  [录制] 当前没有在录制，跳过作废")
+                return
+
+            discarded_frames = len(self.recording_data)
+            self.is_recording = False
+            self.recording_frames1.clear()
+            self.recording_frames2.clear()
+            self.recording_data.clear()
+            self._last_recorded_state = None
+            self._gripper_force_record_frames = 0
+            latest_trace = self.kc.get_recording_snapshot()
+            self._last_trace_seq = int(latest_trace["seq_id"])
+
+        print(f"  [录制] 当前轨迹已作废，不保存 ({discarded_frames} 帧)")
+
     def _save_trajectory(self, frames1, frames2, data):
         """将一段轨迹写入磁盘"""
         if frames1 and data:
@@ -173,16 +196,19 @@ class DataRecorder:
             last_joint_state = np.asarray(data[-1]["joint_state"], dtype=np.float64)
             last_action = np.asarray(data[-1]["action"], dtype=np.float64)
             last_commanded_pose = np.asarray(data[-1]["commanded_pose"], dtype=np.float64)
+            last_timestamp = float(data[-1].get("timestamp", 0.0))
             padded_action = np.zeros_like(last_action)
             padded_action[6] = last_action[6]
 
             last_frame1 = frames1[-1]
             last_frame2 = frames2[-1]
             for _ in range(self.TRAILING_REPEAT_FRAMES):
+                last_timestamp += self.dt
                 frames1.append(last_frame1.copy())
                 frames2.append(last_frame2.copy())
                 data.append({
                     "id": len(data),
+                    "timestamp": round(last_timestamp, 6),
                     "state": last_state.tolist(),
                     "joint_state": last_joint_state.tolist(),
                     "action": padded_action.tolist(),
@@ -279,9 +305,9 @@ class DataRecorder:
         """主采集循环，在独立线程运行。"""
         self.running = True
         control_hint = (
-            "  1: 开始录制   2: 结束录制   ESC: 退出"
+            "  1: 开始录制   2: 结束录制   3: 作废并复位   ESC: 退出"
             if self.kc.input_device == "keyboard"
-            else "  L3: 开始录制   R3: 结束录制   PS: 退出"
+            else "  L3: 开始录制   R3: 结束录制   Cross: 作废并复位   PS: 退出"
         )
 
         print("\n" + "=" * 60)
@@ -309,46 +335,58 @@ class DataRecorder:
         self._on_exit()
 
     def _collect_frame(self):
-        state, joint_state, commanded_pose, action = self.kc.get_recording_snapshot()
-        force_record = False
-
-        if self._should_force_record_for_gripper(state):
-            self._gripper_force_record_frames = self.GRIPPER_EXTRA_KEEP_FRAMES
-
-        if self._gripper_force_record_frames > 0:
-            force_record = True
-
-        if (
-            not force_record
-            and self._is_action_empty(action)
-            and self._is_state_same_as_last_recorded(state)
-        ):
-            self.stats["skipped_frames"] += 1
+        traces = self.kc.get_recording_snapshots_since(self._last_trace_seq)
+        if not traces:
             return
 
-        img1, img2 = self.kc.env.get_camera_frames()
+        for trace in traces:
+            self._last_trace_seq = int(trace["seq_id"])
+            state = np.asarray(trace["state"], dtype=np.float64)
+            joint_state = np.asarray(trace["joint_state"], dtype=np.float64)
+            commanded_pose = np.asarray(trace["commanded_pose"], dtype=np.float64)
+            action = np.asarray(trace["action"], dtype=np.float64)
+            timestamp = float(trace["timestamp"])
+            force_record = False
 
-        recording = False
-        with self.record_lock:
-            recording = self.is_recording
+            if self._should_force_record_for_gripper(state):
+                self._gripper_force_record_frames = self.GRIPPER_EXTRA_KEEP_FRAMES
 
-        if recording:
-            self.recording_frames1.append(img1.copy())
-            self.recording_frames2.append(img2.copy())
-            self.recording_data.append({
-                "id": len(self.recording_data),
-                "state": state.tolist(),
-                "joint_state": joint_state.tolist(),
-                "action": self._scale_action_for_storage(action),
-                "commanded_pose": commanded_pose.tolist(),
-            })
-            self._last_recorded_state = np.asarray(state, dtype=np.float64).copy()
             if self._gripper_force_record_frames > 0:
-                self._gripper_force_record_frames -= 1
+                force_record = True
 
-            if len(self.recording_frames1) >= self.max_frames:
-                print(f"  [录制] 达到最大帧数 {self.max_frames}，自动结束")
-                self.stop_recording()
+            if (
+                not force_record
+                and self._is_action_empty(action)
+                and self._is_state_same_as_last_recorded(state)
+            ):
+                self.stats["skipped_frames"] += 1
+                continue
+
+            img1, img2 = self.kc.env.get_camera_frames()
+
+            recording = False
+            with self.record_lock:
+                recording = self.is_recording
+
+            if recording:
+                self.recording_frames1.append(img1.copy())
+                self.recording_frames2.append(img2.copy())
+                self.recording_data.append({
+                    "id": len(self.recording_data),
+                    "timestamp": round(timestamp, 6),
+                    "state": state.tolist(),
+                    "joint_state": joint_state.tolist(),
+                    "action": self._scale_action_for_storage(action),
+                    "commanded_pose": commanded_pose.tolist(),
+                })
+                self._last_recorded_state = state.copy()
+                if self._gripper_force_record_frames > 0:
+                    self._gripper_force_record_frames -= 1
+
+                if len(self.recording_frames1) >= self.max_frames:
+                    print(f"  [录制] 达到最大帧数 {self.max_frames}，自动结束")
+                    self.stop_recording()
+                    break
 
     def _print_status(self):
         state, _ = self.kc.get_state_and_action()
@@ -455,6 +493,11 @@ def main():
             if char == '2':
                 recorder.stop_recording()
                 return
+            if char == '3':
+                recorder.discard_recording()
+                kc._open_gripper()
+                kc._reset()
+                return
             _orig_on_press(key)
 
         print("[DEBUG] 启动键盘监听...")
@@ -466,6 +509,7 @@ def main():
     else:
         kc.bind_event("record_start", recorder.start_recording)
         kc.bind_event("record_stop", recorder.stop_recording)
+        kc.bind_event("record_discard", recorder.discard_recording)
         print("[DEBUG] PS4 手柄模式运行中...")
         try:
             while kc.running:

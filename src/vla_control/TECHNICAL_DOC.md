@@ -139,6 +139,7 @@ TrajectoryReplayRecorder.run()
   - `_next_action`
   - `_resolve_goal_pose`
   - `_maybe_update_gripper`
+  - `_record_control_trace`
   - `_publish_interp_pose`
   - `_publish_termination`
 - 缓存与姿态 helper
@@ -235,8 +236,9 @@ ta[6] = 0.0 if ta[6] >= 0 else 0.08
 2. 从 action 队列取一个动作
 3. 计算新的目标位姿
 4. 更新 `commanded_pose_array`
-5. 如有需要则异步控制夹爪
-6. 在 `CONTROL_DT` 内按 `INTERP_DT` 做 min-jerk 插值并发布 sensor message
+5. 将 `timestamp/state/joint_state/action/commanded_pose` 作为一条原子 control trace 写入缓存
+6. 如有需要则异步控制夹爪
+7. 在 `CONTROL_DT` 内按 `INTERP_DT` 做 min-jerk 插值并发布 sensor message
 
 ### 退出阶段
 
@@ -292,6 +294,8 @@ ROTATIONAL_STIFFNESS = FC.DEFAULT_ROTATIONAL_STIFFNESSES
 - `_cached_gripper_width`
 - `_cached_ee_force_torque`
 - `_commanded_pose_array`
+- `_control_trace_sample`
+- `_control_trace_history`
 - `_prev_rotvec`
 
 设计目的：
@@ -299,6 +303,7 @@ ROTATIONAL_STIFFNESS = FC.DEFAULT_ROTATIONAL_STIFFNESSES
 - `get_observation()` 尽量读缓存，避免重复走 ROS API
 - 前端可以读取最新目标位姿和末端力矩
 - 旋转向量在跨帧时尽量保持连续
+- 采集 / 回放 / 遥测都从统一的 control trace 获取已对齐底层数据
 
 旋转向量相关 helper 的职责分工：
 
@@ -328,7 +333,7 @@ ROTATIONAL_STIFFNESS = FC.DEFAULT_ROTATIONAL_STIFFNESSES
 
 - 读取历史 `data.csv`
 - 按给定频率把 action 送回 `FrankaEnv`
-- 同时重新记录 replay 时看到的 state/action
+- 同时从 env control trace 重新记录 replay 时实际执行的 `timestamp/state/action`
 
 当前拆分为四个步骤：
 
