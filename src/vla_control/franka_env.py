@@ -49,6 +49,9 @@ from scipy.spatial.transform import Rotation
 CONTROL_DT = 0.1   # 每个 action 的执行周期（s），决定控制频率（10Hz）
 INTERP_DT = 0.02   # 50Hz：与 key_control 的发布频率一致
 INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 15
 
 POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
 ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
@@ -99,12 +102,22 @@ def _apply_action_transform(
 class D435Camera:
     """单路 D435，pyrealsense2 直连 USB。serial_number=None 时自动选第一个设备。"""
 
-    def __init__(self, serial_number: str | None = None, width=640, height=480, fps=30):
+    def __init__(
+        self,
+        serial_number: str | None = None,
+        width: int = CAMERA_WIDTH,
+        height: int = CAMERA_HEIGHT,
+        fps: int = CAMERA_FPS,
+    ):
         self._serial = serial_number
         self._width = width
         self._height = height
         self._fps = fps
         self._pipeline = None
+        self._latest_frame = np.zeros((self._height, self._width, 3), dtype=np.uint8)
+        self._frame_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._reader_thread: threading.Thread | None = None
 
     def start(self):
         if not HAS_REALSENSE:
@@ -115,13 +128,33 @@ class D435Camera:
         config.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
         self._pipeline = rs.pipeline()
         self._pipeline.start(config)
+        self._stop_event.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _reader_loop(self):
+        while not self._stop_event.is_set() and self._pipeline is not None:
+            try:
+                frames = self._pipeline.wait_for_frames()
+                color = frames.get_color_frame()
+                if not color:
+                    continue
+                frame = np.asanyarray(color.get_data())
+                with self._frame_lock:
+                    self._latest_frame = frame.copy()
+            except Exception as e:
+                logger.warning(f"相机读帧失败，将保持上一帧缓存：{e}")
+                break
 
     def get_frame(self) -> np.ndarray:
-        frames = self._pipeline.wait_for_frames()
-        color = frames.get_color_frame()
-        return np.asanyarray(color.get_data())
+        with self._frame_lock:
+            return self._latest_frame.copy()
 
     def stop(self):
+        self._stop_event.set()
+        if self._reader_thread is not None and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=1.0)
+        self._reader_thread = None
         if self._pipeline is not None:
             self._pipeline.stop()
             self._pipeline = None
@@ -133,7 +166,7 @@ class DualD435:
     def __init__(self, cam1_serial: str | None = None, cam2_serial: str | None = None):
         self._cam1 = D435Camera(cam1_serial)
         self._cam2 = D435Camera(cam2_serial)
-        self._black = np.zeros((480, 640, 3), dtype=np.uint8)
+        self._black = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
 
     def start(self):
         for cam in (self._cam1, self._cam2):
@@ -191,50 +224,33 @@ def normalize_rotvec(rotvec: np.ndarray) -> np.ndarray:
 
 
 def normalize_rotvec_with_history(rotvec: np.ndarray, prev_rotvec: np.ndarray | None) -> np.ndarray:
-    """在单帧规范化基础上，尽量保持跨帧连续。
+    """在等价轴角表示中选取与上一帧最接近的分支。
 
-    行为分两步：
-    1. 先将当前帧和上一帧都折叠到 [-pi, pi]
-    2. 若发现当前角度相对上一帧跨越了 pi，则通过 +/- 2pi 做 unwrap，
-       让数值表示更接近上一帧
+    只保证时间连续性，不引入任何分布偏置：
+    - 无历史帧时，返回单帧 canonical rotvec
+    - 有历史帧时，在当前旋转的等价 rotvec 中选择离上一帧最近的表示
 
-    返回值可能超出 [-pi, pi]，这是有意为之：它牺牲单帧 canonical form，
-    换取时间序列上的平滑性。
+    返回值允许超出 [-pi, pi]，这是连续性的代价。
     """
     rotvec = np.asarray(rotvec, dtype=np.float64).copy()
 
     if prev_rotvec is None:
         return normalize_rotvec(rotvec)
 
-    current_angle = np.linalg.norm(rotvec)
-    if current_angle < 1e-6:
-        return rotvec
+    base = normalize_rotvec(rotvec)
+    angle = np.linalg.norm(base)
+    if angle < 1e-6:
+        return np.zeros(3, dtype=np.float64)
 
-    current_axis = rotvec / current_angle
-    current_angle = np.angle(np.exp(1j * current_angle))
+    axis = base / angle
+    candidates: list[np.ndarray] = []
+    for wrap in range(-2, 3):
+        two_pi = 2.0 * np.pi * wrap
+        candidates.append(axis * (angle + two_pi))
+        candidates.append(-axis * ((2.0 * np.pi - angle) + two_pi))
 
-    prev_angle = np.linalg.norm(prev_rotvec)
-    if prev_angle < 1e-6:
-        prev_angle = 0.0
-        prev_axis = np.array([0., 0., 1.])
-    else:
-        prev_axis = prev_rotvec / prev_angle
-        prev_angle = np.angle(np.exp(1j * prev_angle))
-
-    angle_diff = current_angle - prev_angle
-
-    if abs(angle_diff) > np.pi:
-        if angle_diff > 0:
-            current_angle -= 2 * np.pi
-        else:
-            current_angle += 2 * np.pi
-
-    if abs(current_angle) < 0.1:
-        axis_dot = np.dot(current_axis, prev_axis)
-        if axis_dot < -0.9:
-            return -prev_rotvec
-
-    return current_axis * current_angle
+    prev_rotvec = np.asarray(prev_rotvec, dtype=np.float64)
+    return min(candidates, key=lambda candidate: np.linalg.norm(candidate - prev_rotvec))
 
 
 class FrankaEnv:
@@ -272,6 +288,7 @@ class FrankaEnv:
         self._skill_thread: threading.Thread | None = None
         self._skill_stop = threading.Event()
         self._lock = threading.Lock()
+        self._fa_api_lock = threading.RLock()
         self._commanded_pose_array = np.zeros(6)
         
         # 实际位姿缓存：_skill_loop 定期更新，get_observation 读取，避免重复调用 ROS API
@@ -295,8 +312,14 @@ class FrankaEnv:
     def stop(self):
         self.stop_control()
 
-    def start_control(self):
+    def start_control(self, *, home_first: bool = False):
         self.start()
+        if self._fa is not None:
+            if home_first:
+                logger.info("启动控制前回到 home...")
+                with self._fa_api_lock:
+                    self._fa.reset_joints()
+            self._refresh_robot_cache()
         self.start_skill_thread()
 
     def stop_control(self):
@@ -309,7 +332,10 @@ class FrankaEnv:
             logger.warning("机械臂不可用，跳过 reset_to_home")
             return
         self._stop_skill_thread()
-        self._fa.reset_joints()
+        self._wait_for_skill_idle()
+        with self._fa_api_lock:
+            self._fa.reset_joints()
+        self._refresh_robot_cache()
 
     def home_and_restart(self):
         self.reset_to_home()
@@ -346,9 +372,10 @@ class FrankaEnv:
         self._commanded_pose_array = np.concatenate([pose.translation, rot_vec])
 
     def _read_robot_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        pose_rt = self._fa.get_pose()
-        joints = self._fa.get_joints()
-        half = self._fa.get_gripper_width() / 2.0
+        with self._fa_api_lock:
+            pose_rt = self._fa.get_pose()
+            joints = self._fa.get_joints()
+            half = self._fa.get_gripper_width() / 2.0
         return pose_rt.translation, self._pose_to_rotvec(pose_rt), joints, half
 
     def _get_robot_state_for_observation(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
@@ -394,11 +421,13 @@ class FrankaEnv:
         return np.asarray(joints, dtype=np.float64).copy()
 
     def _refresh_robot_cache(self):
-        with self._lock:
+        with self._fa_api_lock:
             actual_pose = self._fa.get_pose()
             actual_joints = self._fa.get_joints()
             actual_gripper_half = self._fa.get_gripper_width() / 2.0
             ee_force_torque = self._fa.get_ee_force_torque()
+
+        with self._lock:
             raw_rot_vec = self._pose_to_rotvec(actual_pose)
             rot_vec = normalize_rotvec_with_history(raw_rot_vec, self._prev_rotvec)
 
@@ -406,23 +435,25 @@ class FrankaEnv:
             self._cached_joints = actual_joints
             self._cached_gripper_width = actual_gripper_half
             self._cached_ee_force_torque = ee_force_torque
-            self._prev_rotvec = raw_rot_vec.copy()
+            self._prev_rotvec = rot_vec.copy()
 
     def _start_dynamic_skill(self, fa: "FrankaArm") -> tuple["RigidTransform", float]:
         logger.info("等待机械臂状态同步...")
         time.sleep(1.0)
-        current_pose = fa.get_pose()
+        with self._fa_api_lock:
+            current_pose = fa.get_pose()
 
         logger.info("启动 dynamic skill...")
-        fa.goto_pose(
-            current_pose,
-            duration=self._dynamic_duration,
-            dynamic=True,
-            buffer_time=20.0,
-            cartesian_impedances=TRANSLATIONAL_STIFFNESS + ROTATIONAL_STIFFNESS,
-            block=False,
-        )
-        init_time = fa.get_time()
+        with self._fa_api_lock:
+            fa.goto_pose(
+                current_pose,
+                duration=self._dynamic_duration,
+                dynamic=True,
+                buffer_time=20.0,
+                cartesian_impedances=TRANSLATIONAL_STIFFNESS + ROTATIONAL_STIFFNESS,
+                block=False,
+            )
+            init_time = fa.get_time()
         self._set_commanded_pose_array(current_pose)
         logger.info("dynamic skill 就绪，开始接收 action")
         return current_pose.copy(), init_time
@@ -453,7 +484,8 @@ class FrankaEnv:
     ) -> float:
         gripper_target = action[6]
         if last_gripper is None or gripper_target != last_gripper:
-            fa.goto_gripper(gripper_target, block=False, speed=GRIPPER_SPEED)
+            with self._fa_api_lock:
+                fa.goto_gripper(gripper_target, block=False, speed=GRIPPER_SPEED)
             return gripper_target
         return last_gripper
 
@@ -473,7 +505,8 @@ class FrankaEnv:
             w = min_jerk_weight(t, CONTROL_DT)
             interp_pose = goal_pose.interpolate_with(start_pose, 1.0 - w)
             msg_id += 1
-            timestamp = fa.get_time() - init_time
+            with self._fa_api_lock:
+                timestamp = fa.get_time() - init_time
             traj_proto = PosePositionSensorMessage(
                 id=msg_id,
                 timestamp=timestamp,
@@ -494,7 +527,8 @@ class FrankaEnv:
                     impedance_proto, SensorDataMessageType.CARTESIAN_IMPEDANCE
                 ),
             )
-            fa.publish_sensor_data(ros_msg)
+            with self._fa_api_lock:
+                fa.publish_sensor_data(ros_msg)
             deadline = cycle_start + idx * INTERP_DT
             remaining = deadline - time.perf_counter()
             if remaining > 0:
@@ -507,7 +541,8 @@ class FrankaEnv:
         return msg_id
 
     def _publish_termination(self, fa: "FrankaArm", init_time: float):
-        timestamp = fa.get_time() - init_time
+        with self._fa_api_lock:
+            timestamp = fa.get_time() - init_time
         term_msg = ShouldTerminateSensorMessage(
             timestamp=timestamp, should_terminate=True
         )
@@ -516,8 +551,26 @@ class FrankaEnv:
                 term_msg, SensorDataMessageType.SHOULD_TERMINATE
             )
         )
-        fa.publish_sensor_data(ros_msg)
+        with self._fa_api_lock:
+            fa.publish_sensor_data(ros_msg)
         logger.info("dynamic skill 已终止")
+
+    def _wait_for_skill_idle(self, timeout: float = 5.0):
+        """等待底层 FrankaArm skill 完全退出，避免后续命令被判定为 active skill。"""
+        if self._fa is None:
+            return
+
+        start = time.perf_counter()
+        try:
+            with self._fa_api_lock:
+                self._fa.wait_for_skill()
+        except Exception:
+            logger.exception("等待 dynamic skill 退出失败")
+            raise
+        finally:
+            elapsed = time.perf_counter() - start
+            if elapsed > timeout:
+                logger.warning("等待 dynamic skill 退出耗时 %.2fs", elapsed)
 
     # ------------------------------------------------------------------
     # obs 采集
@@ -566,12 +619,15 @@ class FrankaEnv:
         self._skill_stop.set()
         # 放一个哨兵让线程从阻塞的 get 中醒来
         self._action_queue.put(None)
-        if self._skill_thread is not None:
-            self._skill_thread.join(timeout=3.0)
-            if self._skill_thread.is_alive():
+        thread = self._skill_thread
+        if thread is not None:
+            thread.join(timeout=3.0)
+            if thread.is_alive():
                 logger.warning("dynamic skill 线程在 3.0s 内未退出，保留线程引用并阻止重复启动")
             else:
-                self._skill_thread = None
+                with self._lock:
+                    if self._skill_thread is thread:
+                        self._skill_thread = None
 
     def _skill_loop(self):
         """
@@ -626,9 +682,26 @@ class FrankaEnv:
                 if self._skill_thread is thread:
                     self._skill_thread = None
 
-    def enqueue_action(self, action: np.ndarray, *, transform: bool = True):
-        """外部调用：将一个 action 放入队列，由 _skill_loop 消费。"""
-        self._action_queue.put((np.asarray(action, dtype=np.float64), transform))
+    def enqueue_action(
+        self,
+        action: np.ndarray,
+        *,
+        transform: bool = True,
+        latest_only: bool = False,
+    ):
+        """外部调用：将一个 action 放入队列，由 _skill_loop 消费。
+
+        latest_only=True 时会丢弃队列中尚未执行的旧动作，仅保留最新动作，
+        适用于键盘/手柄遥操作，避免控制延迟因 FIFO 积压而固定放大。
+        """
+        action_arr = np.asarray(action, dtype=np.float64)
+        if latest_only:
+            while True:
+                try:
+                    self._action_queue.get_nowait()
+                except queue.Empty:
+                    break
+        self._action_queue.put((action_arr, transform))
 
     def hold_pose(self):
         """外部调用：放一个 None 进队列，让 _skill_loop 保持当前位姿一拍。"""

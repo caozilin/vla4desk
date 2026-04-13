@@ -105,6 +105,6 @@ python src/data_collection/trajectory_replay_recorder.py \
 ./start_data_collector.sh --task_name simple_pick_place
 ```
 
-## TODO
+## 轴角约束
 
-- 根据 OpenVLA 数据集中的轴角状态分布，以及真机 `state[3:6]` 的实际观测分布，综合设计一个兼顾连续性、数值稳定性和训练/推理一致性的轴角约束函数。
+- 已在 `FrankaEnv` 中实现 `state[3:6]` 的连续性约束：无历史帧时使用单帧 canonical rotvec；有历史帧时，在等价轴角表示中选择与上一帧最接近的分支，避免 `±pi` 附近的跳变。

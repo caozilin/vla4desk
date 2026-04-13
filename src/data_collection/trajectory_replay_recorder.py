@@ -39,6 +39,20 @@ def _load_episode_json(json_path: pathlib.Path) -> tuple[dict, list[dict[str, li
     return payload, samples
 
 
+def _decode_stored_action(action: list[float], action_scale: float) -> np.ndarray:
+    """从 JSON 读取 action：仅还原前 6 维，夹爪维度保持原值。"""
+    decoded = np.asarray(action, dtype=np.float64).copy()
+    decoded[:6] /= action_scale
+    return decoded
+
+
+def _encode_action_for_storage(action: np.ndarray, action_scale: float) -> list[float]:
+    """写回 JSON 时仅缩放前 6 维，夹爪维度保持 -1/1 原值。"""
+    encoded = np.asarray(action, dtype=np.float64).copy()
+    encoded[:6] *= action_scale
+    return encoded.tolist()
+
+
 def _resolve_episode_dir(args: argparse.Namespace) -> pathlib.Path:
     if args.episode:
         episode_dir = pathlib.Path(args.episode).expanduser().resolve()
@@ -134,12 +148,12 @@ class TrajectoryReplayRecorder:
         obs, _, _ = self.env.get_observation(self.prompt)
         state = obs["observation/state"].astype(np.float64).tolist()
         joint_state = obs["observation/joints"].astype(np.float64).tolist()
-        action = np.asarray(sample["action"], dtype=np.float64) / self.action_scale
+        action = _decode_stored_action(sample["action"], self.action_scale)
         self.logged_rows.append(
             {
                 "state": state,
                 "joint_state": joint_state,
-                "action": (action * self.action_scale).tolist(),
+                "action": _encode_action_for_storage(action, self.action_scale),
             }
         )
         self.env.enqueue_action(action, transform=False)

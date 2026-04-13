@@ -305,11 +305,11 @@ ROTATIONAL_STIFFNESS = FC.DEFAULT_ROTATIONAL_STIFFNESSES
 - `normalize_rotvec(rotvec)`
   只做单帧规范化，把角度折叠到 `[-pi, pi]`，不关心跨帧连续性
 - `normalize_rotvec_with_history(rotvec, prev_rotvec)`
-  在单帧规范化基础上，结合上一帧做 unwrap，尽量减少相邻帧在 `±pi` 附近的跳变
+  在当前旋转的等价轴角表示中，选择与上一帧最接近的分支，只保证跨帧连续性
 - `_set_commanded_pose_array()`
   用单帧规范化后的 rotvec 更新目标位姿显示
 - `_refresh_robot_cache()`
-  用带历史的规范化结果更新实际位姿缓存，优先保证观测和遥测的时间连续性
+  用带历史的规范化结果更新实际位姿缓存，并把该连续表示继续作为下一帧历史
 
 线程同步使用：
 

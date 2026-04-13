@@ -45,14 +45,27 @@ from pynput import keyboard
 # 相机封装（与 franka_env.py 保持一致）
 # ==================================================================
 
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 15
+
 class D435Camera:
-    def __init__(self, serial_number: str | None = None,
-                 width=640, height=480, fps=30):
+    def __init__(
+        self,
+        serial_number: str | None = None,
+        width: int = CAMERA_WIDTH,
+        height: int = CAMERA_HEIGHT,
+        fps: int = CAMERA_FPS,
+    ):
         self._serial = serial_number
         self._width = width
         self._height = height
         self._fps = fps
         self._pipeline = None
+        self._latest_frame = np.zeros((self._height, self._width, 3), dtype=np.uint8)
+        self._frame_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._reader_thread: threading.Thread | None = None
 
     def start(self):
         try:
@@ -63,17 +76,36 @@ class D435Camera:
                               rs.format.rgb8, self._fps)
             self._pipeline = rs.pipeline()
             self._pipeline.start(cfg)
+            self._stop_event.clear()
+            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader_thread.start()
         except RuntimeError as e:
             logging.warning(f"相机 {self._serial} 启动失败: {e}")
             self._pipeline = None
 
+    def _reader_loop(self):
+        while not self._stop_event.is_set() and self._pipeline is not None:
+            try:
+                frames = self._pipeline.wait_for_frames()
+                color = frames.get_color_frame()
+                if not color:
+                    continue
+                frame = np.asanyarray(color.get_data())
+                with self._frame_lock:
+                    self._latest_frame = frame.copy()
+            except RuntimeError as e:
+                logging.warning(f"相机 {self._serial} 读帧失败，将保持上一帧缓存: {e}")
+                break
+
     def get_frame(self) -> np.ndarray:
-        if self._pipeline is None:
-            return np.zeros((480, 640, 3), dtype=np.uint8)
-        frames = self._pipeline.wait_for_frames()
-        return np.asanyarray(frames.get_color_frame().get_data())
+        with self._frame_lock:
+            return self._latest_frame.copy()
 
     def stop(self):
+        self._stop_event.set()
+        if self._reader_thread is not None and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=1.0)
+        self._reader_thread = None
         if self._pipeline:
             self._pipeline.stop()
             self._pipeline = None
@@ -191,6 +223,12 @@ class DataRecorder:
         self.running = True
         self._exited = False  # 防止 _on_exit 被多次调用
         self._last_recorded_state: np.ndarray | None = None
+
+    def _scale_action_for_storage(self, action: np.ndarray) -> list[float]:
+        """仅缩放位姿维度，夹爪命令保持 -1/1 原值。"""
+        scaled_action = np.asarray(action, dtype=np.float64).copy()
+        scaled_action[:6] *= self.action_scale
+        return scaled_action.tolist()
 
     # ------------------------------------------------------------------
     # 录制控制
@@ -370,11 +408,10 @@ class DataRecorder:
         if recording:
             self.recording_frames1.append(img1.copy())
             self.recording_frames2.append(img2.copy())
-            scaled_action = (np.asarray(action, dtype=np.float64) * self.action_scale).tolist()
             self.recording_data.append({
                 "state": state.tolist(),
                 "joint_state": joint_state.tolist(),
-                "action": scaled_action,
+                "action": self._scale_action_for_storage(action),
             })
             self._last_recorded_state = np.asarray(state, dtype=np.float64).copy()
 
@@ -439,6 +476,12 @@ def main():
         default=0,
         help="PS4 手柄索引，默认 0。",
     )
+    parser.add_argument(
+        "--rotation_input_frame",
+        choices=("eef", "base"),
+        default="eef",
+        help="旋转输入按哪个坐标系解释，默认 eef，可选 base。",
+    )
     args = parser.parse_args()
 
     from key_control import KeyboardController
@@ -446,6 +489,7 @@ def main():
     kc = KeyboardController(
         input_device=args.input_device,
         joystick_index=args.joystick_index,
+        rotation_input_frame=args.rotation_input_frame,
     )
     print("[DEBUG] 启动控制线程...")
     kc.start()

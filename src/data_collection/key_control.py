@@ -5,7 +5,7 @@ Franka Panda 键盘遥操作控制器
 提供：
   - 10Hz 输入采样：读取按键并计算当前这拍的 action 增量
   - 通过 FrankaEnv.enqueue_action() 将动作送入唯一的 dynamic skill 执行线程
-  - 按键 → 位姿增量的映射（平移按基座系，旋转输入按末端系解释）
+  - 按键 → 位姿增量的映射（平移按基座系，旋转输入可选基座系或末端系）
   - 输出 action 统一使用基座坐标系 rotvec 语义
   - 保持采集侧独立的最大速度配置，不复用 env 的动作缩放
 
@@ -90,12 +90,20 @@ class KeyboardController:
         running            bool  程序是否在运行
     """
 
-    def __init__(self, input_device: str = "keyboard", joystick_index: int = 0):
+    def __init__(
+        self,
+        input_device: str = "keyboard",
+        joystick_index: int = 0,
+        rotation_input_frame: str = "eef",
+    ):
         if input_device not in ("keyboard", "ps4"):
             raise ValueError(f"不支持的输入设备: {input_device}")
+        if rotation_input_frame not in ("eef", "base"):
+            raise ValueError(f"不支持的旋转输入坐标系: {rotation_input_frame}")
 
         self.input_device = input_device
         self.joystick_index = joystick_index
+        self.rotation_input_frame = rotation_input_frame
         self.env = FrankaEnv()
 
         self.gripper_target = 0.04   # 默认半开
@@ -107,6 +115,13 @@ class KeyboardController:
         # 按键状态
         self.keys_pressed: set = set()
         self._keys_lock = threading.Lock()
+        self._motion_keys = {
+            "w", "s", "a", "d",
+            "i", "k",
+            "q", "e",
+            "u", "o",
+            "j", "l",
+        }
 
         # 线程管理
         self._input_thread: threading.Thread | None = None
@@ -123,7 +138,6 @@ class KeyboardController:
         self._joystick = None
         self._prev_buttons: dict[int, bool] = {}
         self._prev_hat = (0, 0)
-
         if self.input_device == "ps4":
             self._init_ps4()
 
@@ -134,7 +148,7 @@ class KeyboardController:
     def start(self):
         """启动 env 与输入线程（daemon），不阻塞。"""
         self._print_controls()
-        self.env.start_control()
+        self.env.start_control(home_first=True)
         self._latest_state = self.env.get_robot_state_vector()
         self._latest_action = np.zeros(7, dtype=np.float64)
         self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
@@ -198,6 +212,8 @@ class KeyboardController:
                 self._half_gripper(); return
 
             self.keys_pressed.add(char)
+            if char in self._motion_keys:
+                logging.info("键盘按下: key=%s active=%s", char, "".join(sorted(self.keys_pressed)))
 
     def _on_key_release(self, key):
         if self.input_device != "keyboard":
@@ -208,6 +224,8 @@ class KeyboardController:
             char = key.name.lower()
         with self._keys_lock:
             self.keys_pressed.discard(char)
+            if char in self._motion_keys:
+                logging.info("键盘释放: key=%s active=%s", char, "".join(sorted(self.keys_pressed)))
 
     def _init_ps4(self):
         if pygame is None:
@@ -249,11 +267,13 @@ class KeyboardController:
         if self.input_device == "keyboard":
             print("  [控制] 键盘模式")
             print("  [控制] W/S:X  A/D:Y  I/K:Z  Q/E:Roll  U/O:Pitch  J/L:Yaw")
+            print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
             print("  [控制] G/H/F:夹爪  +/-:速度档位  R:复位  1/2:开始/结束录制  ESC:退出")
             return
 
         print("  [控制] PS4 手柄模式")
         print("  [控制] 左摇杆:X/Y平移  右摇杆:Z平移/Yaw  L1/R1:Roll  L2/R2:Pitch")
+        print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
         print("  [控制] 方块/圆圈/三角:关闭/打开/半开夹爪  十字键左右:速度档位")
         print("  [控制] L3/R3:开始/结束录制  OPTIONS:复位  PS:退出")
 
@@ -385,6 +405,17 @@ class KeyboardController:
         delta_base = current_rot @ delta_local @ current_rot.T
         return Rotation.from_matrix(delta_base).as_rotvec()
 
+    def _convert_rot_delta_to_base(
+        self,
+        rot_delta: np.ndarray,
+        state: np.ndarray | None,
+    ) -> np.ndarray:
+        """将输入设备旋转增量统一转换为基座系 rotvec。"""
+        rot_delta = np.asarray(rot_delta, dtype=np.float64)
+        if self.rotation_input_frame == "base":
+            return rot_delta.copy()
+        return self._convert_local_rot_delta_to_base(rot_delta, state)
+
     # ------------------------------------------------------------------
     # 输入线程
     # ------------------------------------------------------------------
@@ -399,7 +430,7 @@ class KeyboardController:
         dyaw: float,
         state: np.ndarray | None,
     ) -> np.ndarray:
-        delta_rot_base = self._convert_local_rot_delta_to_base(
+        delta_rot_base = self._convert_rot_delta_to_base(
             np.array([droll, dpitch, dyaw], dtype=np.float64),
             state,
         )
@@ -427,7 +458,11 @@ class KeyboardController:
             dx, dy, dz, droll, dpitch, dyaw = self._get_input_delta()
             action = self._build_action(dx, dy, dz, droll, dpitch, dyaw, state)
             self._latest_action = action.copy()
-            self.env.enqueue_action(action, transform=False)
+            self.env.enqueue_action(
+                action,
+                transform=False,
+                latest_only=True,
+            )
             self._latest_state = state.copy()
 
             next_tick += INPUT_DT
@@ -471,6 +506,9 @@ class KeyboardController:
             self._latest_state = self.env.get_robot_state_vector()
             self._latest_action = self._build_action(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self._latest_state)
             print("  [复位] 完成")
+        except Exception:
+            logging.exception("复位失败")
+            print("  [复位] 失败，请查看日志")
         finally:
             self._reset_lock.release()
 
