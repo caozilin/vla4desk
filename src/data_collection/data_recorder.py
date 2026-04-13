@@ -37,103 +37,7 @@ from collections import deque
 
 import imageio
 import numpy as np
-import pyrealsense2 as rs
 from pynput import keyboard
-
-
-# ==================================================================
-# 相机封装（与 franka_env.py 保持一致）
-# ==================================================================
-
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
-CAMERA_FPS = 15
-
-class D435Camera:
-    def __init__(
-        self,
-        serial_number: str | None = None,
-        width: int = CAMERA_WIDTH,
-        height: int = CAMERA_HEIGHT,
-        fps: int = CAMERA_FPS,
-    ):
-        self._serial = serial_number
-        self._width = width
-        self._height = height
-        self._fps = fps
-        self._pipeline = None
-        self._latest_frame = np.zeros((self._height, self._width, 3), dtype=np.uint8)
-        self._frame_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._reader_thread: threading.Thread | None = None
-
-    def start(self):
-        try:
-            cfg = rs.config()
-            if self._serial:
-                cfg.enable_device(self._serial)
-            cfg.enable_stream(rs.stream.color, self._width, self._height,
-                              rs.format.rgb8, self._fps)
-            self._pipeline = rs.pipeline()
-            self._pipeline.start(cfg)
-            self._stop_event.clear()
-            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-            self._reader_thread.start()
-        except RuntimeError as e:
-            logging.warning(f"相机 {self._serial} 启动失败: {e}")
-            self._pipeline = None
-
-    def _reader_loop(self):
-        while not self._stop_event.is_set() and self._pipeline is not None:
-            try:
-                frames = self._pipeline.wait_for_frames()
-                color = frames.get_color_frame()
-                if not color:
-                    continue
-                frame = np.asanyarray(color.get_data())
-                with self._frame_lock:
-                    self._latest_frame = frame.copy()
-            except RuntimeError as e:
-                logging.warning(f"相机 {self._serial} 读帧失败，将保持上一帧缓存: {e}")
-                break
-
-    def get_frame(self) -> np.ndarray:
-        with self._frame_lock:
-            return self._latest_frame.copy()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._reader_thread is not None and self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=1.0)
-        self._reader_thread = None
-        if self._pipeline:
-            self._pipeline.stop()
-            self._pipeline = None
-
-
-class DualD435:
-    def __init__(self, cam1_serial: str | None = None, cam2_serial: str | None = None):
-        self._cam1 = D435Camera(cam1_serial)
-        self._cam2 = D435Camera(cam2_serial)
-
-    def start(self):
-        self._cam1.start()
-        self._cam2.start()
-
-    def get_frames(self):
-        return self._cam1.get_frame(), self._cam2.get_frame()
-
-    def stop(self):
-        self._cam1.stop()
-        self._cam2.stop()
-
-
-# ==================================================================
-# 相机参数（与 vla4desk/coordinator.py 保持一致）
-# ==================================================================
-
-CAM1_SERIAL = "346222072769"
-CAM2_SERIAL = "938422075745"
 
 
 # ==================================================================
@@ -164,6 +68,9 @@ class DataRecorder:
     STATE_THRESH_POS = 0.0005    # m
     STATE_THRESH_ROT = 0.005     # rad
     STATE_THRESH_GRIPPER = 0.0005  # m
+    GRIPPER_WIDTH_OPEN = 0.08
+    GRIPPER_WIDTH_CLOSED = 0.0
+    GRIPPER_EXTRA_KEEP_FRAMES = 5
     TRAILING_REPEAT_FRAMES = 10
     ACTION_SCALE = 100.0
     PROMPT = ""
@@ -203,13 +110,6 @@ class DataRecorder:
             else self.ACTION_THRESH_ROT
         )
 
-        # 相机
-        self.cameras = DualD435(
-            cam1_serial or CAM1_SERIAL,
-            cam2_serial or CAM2_SERIAL
-        )
-        self.cameras.start()
-
         # 录制状态
         self.is_recording = False
         self.recording_frames1: deque = deque(maxlen=self.max_frames)
@@ -223,6 +123,7 @@ class DataRecorder:
         self.running = True
         self._exited = False  # 防止 _on_exit 被多次调用
         self._last_recorded_state: np.ndarray | None = None
+        self._gripper_force_record_frames = 0
 
     def _scale_action_for_storage(self, action: np.ndarray) -> list[float]:
         """仅缩放位姿维度，夹爪命令保持 -1/1 原值。"""
@@ -245,6 +146,7 @@ class DataRecorder:
             self.recording_frames2.clear()
             self.recording_data.clear()
             self._last_recorded_state = None
+        self.kc.rumble(0.15, 0.85, 120)
         print("  [录制] 开始 → 按 2 结束当前轨迹")
 
     def stop_recording(self):
@@ -259,6 +161,8 @@ class DataRecorder:
             frames2 = list(self.recording_frames2)
             data = list(self.recording_data)
 
+        self.kc.rumble(0.55, 0.25, 180)
+
         if frames1:
             self._save_trajectory(frames1, frames2, data)
 
@@ -268,6 +172,7 @@ class DataRecorder:
             last_state = np.asarray(data[-1]["state"], dtype=np.float64)
             last_joint_state = np.asarray(data[-1]["joint_state"], dtype=np.float64)
             last_action = np.asarray(data[-1]["action"], dtype=np.float64)
+            last_commanded_pose = np.asarray(data[-1]["commanded_pose"], dtype=np.float64)
             padded_action = np.zeros_like(last_action)
             padded_action[6] = last_action[6]
 
@@ -277,9 +182,11 @@ class DataRecorder:
                 frames1.append(last_frame1.copy())
                 frames2.append(last_frame2.copy())
                 data.append({
+                    "id": len(data),
                     "state": last_state.tolist(),
                     "joint_state": last_joint_state.tolist(),
                     "action": padded_action.tolist(),
+                    "commanded_pose": last_commanded_pose.tolist(),
                 })
 
         task_dir = self.collection_dir / self.task_name
@@ -354,6 +261,16 @@ class DataRecorder:
         )
         return pos_same and rot_same and gripper_same
 
+    def _gripper_width(self, state: np.ndarray) -> float:
+        return float(state[6] - state[7])
+
+    def _should_force_record_for_gripper(self, state: np.ndarray) -> bool:
+        """夹爪处于开合过渡态时，额外保留数帧，避免被去重逻辑吞掉。"""
+        width = self._gripper_width(state)
+        near_closed = abs(width - self.GRIPPER_WIDTH_CLOSED) < self.STATE_THRESH_GRIPPER
+        near_open = abs(width - self.GRIPPER_WIDTH_OPEN) < self.STATE_THRESH_GRIPPER
+        return not (near_closed or near_open)
+
     # ------------------------------------------------------------------
     # 采集循环（在独立线程运行）
     # ------------------------------------------------------------------
@@ -392,14 +309,24 @@ class DataRecorder:
         self._on_exit()
 
     def _collect_frame(self):
-        state, action = self.kc.get_state_and_action()
-        joint_state = self.kc.env.get_joint_state_vector()
+        state, joint_state, commanded_pose, action = self.kc.get_recording_snapshot()
+        force_record = False
 
-        if self._is_action_empty(action) and self._is_state_same_as_last_recorded(state):
+        if self._should_force_record_for_gripper(state):
+            self._gripper_force_record_frames = self.GRIPPER_EXTRA_KEEP_FRAMES
+
+        if self._gripper_force_record_frames > 0:
+            force_record = True
+
+        if (
+            not force_record
+            and self._is_action_empty(action)
+            and self._is_state_same_as_last_recorded(state)
+        ):
             self.stats["skipped_frames"] += 1
             return
 
-        img1, img2 = self.cameras.get_frames()
+        img1, img2 = self.kc.env.get_camera_frames()
 
         recording = False
         with self.record_lock:
@@ -409,11 +336,15 @@ class DataRecorder:
             self.recording_frames1.append(img1.copy())
             self.recording_frames2.append(img2.copy())
             self.recording_data.append({
+                "id": len(self.recording_data),
                 "state": state.tolist(),
                 "joint_state": joint_state.tolist(),
                 "action": self._scale_action_for_storage(action),
+                "commanded_pose": commanded_pose.tolist(),
             })
             self._last_recorded_state = np.asarray(state, dtype=np.float64).copy()
+            if self._gripper_force_record_frames > 0:
+                self._gripper_force_record_frames -= 1
 
             if len(self.recording_frames1) >= self.max_frames:
                 print(f"  [录制] 达到最大帧数 {self.max_frames}，自动结束")
@@ -445,7 +376,6 @@ class DataRecorder:
                 if frames1:
                     self._save_trajectory(frames1, frames2, data)
 
-        self.cameras.stop()
         print("  [退出] 完成")
 
 

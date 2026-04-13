@@ -79,15 +79,15 @@ python src/vla_control/coordinator.py \
 python scripts/serve_policy.py --env libero --policy.config <config> --policy.dir <ckpt_dir>
 ```
 
-### CSV 回放与重记录
+### JSON 回放与重记录
 
 ```bash
-# 按 episode 目录回放，并将 replay 时的 state/action 重新保存为新 CSV
+# 按 episode 目录回放，并将 replay 时的 state/action 重新保存为新 JSON
 python src/data_collection/trajectory_replay_recorder.py \
   --episode collected/<task>/epo_<n> \
   --output_dir collected/<task>/replay_epo_<n>
 
-# 无机械臂模式下联调 CSV 流程
+# 无机械臂模式下联调 JSON 流程
 python src/data_collection/trajectory_replay_recorder.py \
   --episode collected/<task>/epo_<n> \
   --no_robot

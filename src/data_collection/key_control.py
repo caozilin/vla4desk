@@ -47,7 +47,7 @@ MAX_LIN_VEL = 0.1             # 最大线速度 0.1 m/s
 MAX_ROT_VEL = math.pi / 4     # 最大角速度 45°/s
 MAX_DELTA_POS = MAX_LIN_VEL * INPUT_DT     # 0.01 m
 MAX_DELTA_ROT = MAX_ROT_VEL * INPUT_DT     # ≈ 0.0785 rad
-JOYSTICK_DEADZONE = 0.12
+JOYSTICK_DEADZONE = 0.3
 
 PS4_AXIS_LEFT_X = 0
 PS4_AXIS_LEFT_Y = 1
@@ -56,17 +56,16 @@ PS4_AXIS_RIGHT_X = 3
 PS4_AXIS_RIGHT_Y = 4
 PS4_AXIS_R2 = 5
 
-PS4_BUTTON_SQUARE = 0
-PS4_BUTTON_CROSS = 1
-PS4_BUTTON_CIRCLE = 2
-PS4_BUTTON_TRIANGLE = 3
+PS4_BUTTON_CROSS = 0
+PS4_BUTTON_CIRCLE = 1
+PS4_BUTTON_TRIANGLE = 2
+PS4_BUTTON_SQUARE = 3
 PS4_BUTTON_L1 = 4
 PS4_BUTTON_R1 = 5
 PS4_BUTTON_SHARE = 8
 PS4_BUTTON_OPTIONS = 9
-PS4_BUTTON_L3 = 10
-PS4_BUTTON_R3 = 11
-PS4_BUTTON_PS = 12
+PS4_BUTTON_L3 = 11
+PS4_BUTTON_R3 = 12
 
 
 # ==================================================================
@@ -106,10 +105,10 @@ class KeyboardController:
         self.rotation_input_frame = rotation_input_frame
         self.env = FrankaEnv()
 
-        self.gripper_target = 0.04   # 默认半开
-        self.step_size = 0.7          # 速度倍率：3档 [0.4, 0.7, 1.0]
+        self.gripper_target = 0.08   # 默认打开
+        self.step_size = 1.0          # 速度倍率：3档 [0.4, 0.7, 1.0]
         self._speed_levels = [0.4, 0.7, 1.0]  # 3档速度：40%, 70%, 100%
-        self._speed_index = 1                  # 默认第2档（70%）
+        self._speed_index = 2                  # 默认第3档（100%）
         self.running = True
 
         # 按键状态
@@ -129,8 +128,12 @@ class KeyboardController:
         self._reset_lock = threading.Lock()  # 防止并发复位
 
         # 状态缓存
+        self._state_lock = threading.Lock()
         self._latest_state = np.zeros(8, dtype=np.float64)
+        self._latest_joint_state = np.zeros(7, dtype=np.float64)
+        self._latest_commanded_pose = np.zeros(6, dtype=np.float64)
         self._latest_action = np.zeros(7, dtype=np.float64)
+        self._logged_commanded_pose = np.zeros(6, dtype=np.float64)
 
         # 手柄事件
         self._event_callbacks: dict[str, callable] = {}
@@ -138,6 +141,7 @@ class KeyboardController:
         self._joystick = None
         self._prev_buttons: dict[int, bool] = {}
         self._prev_hat = (0, 0)
+        self._rumble_token = 0
         if self.input_device == "ps4":
             self._init_ps4()
 
@@ -149,8 +153,19 @@ class KeyboardController:
         """启动 env 与输入线程（daemon），不阻塞。"""
         self._print_controls()
         self.env.start_control(home_first=True)
-        self._latest_state = self.env.get_robot_state_vector()
-        self._latest_action = np.zeros(7, dtype=np.float64)
+        initial_state = self.env.get_robot_state_vector()
+        initial_joint_state = self.env.get_joint_state_vector()
+        initial_commanded_pose = self.env.commanded_pose_array.copy()
+        if np.allclose(initial_commanded_pose, 0.0) and not np.allclose(initial_state[:6], 0.0):
+            initial_commanded_pose = initial_state[:6].copy()
+        initial_action = np.zeros(7, dtype=np.float64)
+        with self._state_lock:
+            self._latest_state = initial_state
+            self._latest_joint_state = initial_joint_state
+            self._latest_commanded_pose = initial_commanded_pose
+            self._latest_action = initial_action
+            self._logged_commanded_pose = initial_commanded_pose.copy()
+        self.rumble(0.18, 0.7, 120)
         self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
         self._input_thread.start()
 
@@ -208,8 +223,6 @@ class KeyboardController:
                 self._close_gripper(); return
             if char == 'h':
                 self._open_gripper(); return
-            if char == 'f':
-                self._half_gripper(); return
 
             self.keys_pressed.add(char)
             if char in self._motion_keys:
@@ -259,6 +272,7 @@ class KeyboardController:
 
         if self._joystick is not None and self._joystick.get_init():
             self._joystick.quit()
+        self._joystick = None
         pygame.joystick.quit()
         pygame.quit()
         self._pygame_ready = False
@@ -268,79 +282,123 @@ class KeyboardController:
             print("  [控制] 键盘模式")
             print("  [控制] W/S:X  A/D:Y  I/K:Z  Q/E:Roll  U/O:Pitch  J/L:Yaw")
             print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
-            print("  [控制] G/H/F:夹爪  +/-:速度档位  R:复位  1/2:开始/结束录制  ESC:退出")
+            print("  [控制] G/H:夹爪  +/-:速度档位  R:复位  1/2:开始/结束录制  ESC:退出")
             return
 
         print("  [控制] PS4 手柄模式")
         print("  [控制] 左摇杆:X/Y平移  右摇杆:Z平移/Yaw  L1/R1:Roll  L2/R2:Pitch")
         print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
-        print("  [控制] 方块/圆圈/三角:关闭/打开/半开夹爪  十字键左右:速度档位")
-        print("  [控制] L3/R3:开始/结束录制  OPTIONS:复位  PS:退出")
+        print("  [控制] 三角/圆圈:打开/关闭夹爪  方块:复位  十字键左右:速度档位")
+        print("  [控制] L3/R3:开始/结束录制  OPTIONS:退出")
 
     def _emit_event(self, event_name: str):
         callback = self._event_callbacks.get(event_name)
         if callback is not None:
             callback()
 
+    def rumble(self, low: float = 0.0, high: float = 0.0, duration_ms: int = 150):
+        if self.input_device != "ps4" or not self._pygame_ready or self._joystick is None:
+            return
+        try:
+            if hasattr(self._joystick, "rumble"):
+                self._joystick.rumble(low, high, duration_ms)
+                self._rumble_token += 1
+                token = self._rumble_token
+
+                def _stop_later():
+                    time.sleep(max(duration_ms, 1) / 1000.0)
+                    if (
+                        token == self._rumble_token
+                        and self.input_device == "ps4"
+                        and self._pygame_ready
+                        and self._joystick is not None
+                    ):
+                        try:
+                            self._joystick.rumble(0.0, 0.0, 1)
+                        except Exception:
+                            logging.debug("手柄停止震动不可用", exc_info=True)
+
+                threading.Thread(target=_stop_later, daemon=True).start()
+        except Exception:
+            logging.debug("手柄震动不可用", exc_info=True)
+
     def _apply_deadzone(self, value: float) -> float:
-        return 0.0 if abs(value) < JOYSTICK_DEADZONE else float(value)
+        value = float(value)
+        mag = abs(value)
+        if mag < JOYSTICK_DEADZONE:
+            return 0.0
+        scaled = (mag - JOYSTICK_DEADZONE) / (1.0 - JOYSTICK_DEADZONE)
+        return float(np.sign(value) * np.clip(scaled, 0.0, 1.0))
 
     def _read_axis(self, axis_index: int) -> float:
-        if self._joystick is None or axis_index >= self._joystick.get_numaxes():
+        if not self._pygame_ready or self._joystick is None:
             return 0.0
-        return self._apply_deadzone(self._joystick.get_axis(axis_index))
+        try:
+            if axis_index >= self._joystick.get_numaxes():
+                return 0.0
+            return self._apply_deadzone(self._joystick.get_axis(axis_index))
+        except pygame.error:
+            return 0.0
 
     def _read_trigger(self, axis_index: int, fallback_button: int | None = None) -> float:
-        if self._joystick is not None and axis_index < self._joystick.get_numaxes():
-            raw = self._joystick.get_axis(axis_index)
-            normalized = (raw + 1.0) / 2.0
-            if normalized < JOYSTICK_DEADZONE:
-                return 0.0
-            return float(np.clip(normalized, 0.0, 1.0))
+        if not self._pygame_ready or self._joystick is None:
+            return 0.0
+        try:
+            if axis_index < self._joystick.get_numaxes():
+                raw = self._joystick.get_axis(axis_index)
+                normalized = (raw + 1.0) / 2.0
+                if normalized < JOYSTICK_DEADZONE:
+                    return 0.0
+                scaled = (normalized - JOYSTICK_DEADZONE) / (1.0 - JOYSTICK_DEADZONE)
+                return float(np.clip(scaled, 0.0, 1.0))
 
-        if fallback_button is not None and self._joystick is not None:
-            if fallback_button < self._joystick.get_numbuttons():
+            if fallback_button is not None and fallback_button < self._joystick.get_numbuttons():
                 return float(self._joystick.get_button(fallback_button))
+        except pygame.error:
+            return 0.0
         return 0.0
 
-    def _handle_ps4_buttons(self):
-        if self._joystick is None:
-            return
+    def _handle_ps4_buttons(self) -> bool:
+        if not self._pygame_ready or self._joystick is None:
+            return False
 
-        for button_idx in range(self._joystick.get_numbuttons()):
-            pressed = bool(self._joystick.get_button(button_idx))
-            prev_pressed = self._prev_buttons.get(button_idx, False)
-            if pressed and not prev_pressed:
-                if button_idx == PS4_BUTTON_PS:
-                    self.stop()
-                    return
-                if button_idx == PS4_BUTTON_OPTIONS:
-                    self._reset()
-                    return
-                if button_idx == PS4_BUTTON_L3:
-                    self._emit_event("record_start")
-                elif button_idx == PS4_BUTTON_R3:
-                    self._emit_event("record_stop")
-                elif button_idx == PS4_BUTTON_SQUARE:
-                    self._close_gripper()
-                elif button_idx == PS4_BUTTON_CIRCLE:
-                    self._open_gripper()
-                elif button_idx == PS4_BUTTON_TRIANGLE:
-                    self._half_gripper()
-            self._prev_buttons[button_idx] = pressed
+        try:
+            for button_idx in range(self._joystick.get_numbuttons()):
+                pressed = bool(self._joystick.get_button(button_idx))
+                prev_pressed = self._prev_buttons.get(button_idx, False)
+                self._prev_buttons[button_idx] = pressed
+                if pressed and not prev_pressed:
+                    if button_idx == PS4_BUTTON_OPTIONS:
+                        self.rumble(0.9, 0.9, 260)
+                        self.stop()
+                        return False
+                    if button_idx == PS4_BUTTON_SQUARE:
+                        self._reset()
+                        return self.running and not self._stop_event.is_set()
+                    if button_idx == PS4_BUTTON_L3:
+                        self._emit_event("record_start")
+                    elif button_idx == PS4_BUTTON_R3:
+                        self._emit_event("record_stop")
+                    elif button_idx == PS4_BUTTON_TRIANGLE:
+                        self._open_gripper()
+                    elif button_idx == PS4_BUTTON_CIRCLE:
+                        self._close_gripper()
 
-        hat = self._joystick.get_hat(0) if self._joystick.get_numhats() > 0 else (0, 0)
-        prev_hat_x, _ = self._prev_hat
-        hat_x, _ = hat
-        if hat_x == 1 and prev_hat_x != 1:
-            self._speed_index = min(len(self._speed_levels) - 1, self._speed_index + 1)
-            self.step_size = self._speed_levels[self._speed_index]
-            print(f"  [速度] 倍率: {self.step_size*100:.0f}%")
-        elif hat_x == -1 and prev_hat_x != -1:
-            self._speed_index = max(0, self._speed_index - 1)
-            self.step_size = self._speed_levels[self._speed_index]
-            print(f"  [速度] 倍率: {self.step_size*100:.0f}%")
-        self._prev_hat = hat
+            hat = self._joystick.get_hat(0) if self._joystick.get_numhats() > 0 else (0, 0)
+            prev_hat_x, _ = self._prev_hat
+            hat_x, _ = hat
+            if hat_x == 1 and prev_hat_x != 1:
+                self._speed_index = min(len(self._speed_levels) - 1, self._speed_index + 1)
+                self.step_size = self._speed_levels[self._speed_index]
+                print(f"  [速度] 倍率: {self.step_size*100:.0f}%")
+            elif hat_x == -1 and prev_hat_x != -1:
+                self._speed_index = max(0, self._speed_index - 1)
+                self.step_size = self._speed_levels[self._speed_index]
+                print(f"  [速度] 倍率: {self.step_size*100:.0f}%")
+            self._prev_hat = hat
+            return self.running and not self._stop_event.is_set()
+        except pygame.error:
+            return False
 
     def _get_keyboard_delta(self) -> tuple[float, float, float, float, float, float]:
         with self._keys_lock:
@@ -353,11 +411,19 @@ class KeyboardController:
         droll = (int('q' in keys) - int('e' in keys)) * MAX_DELTA_ROT * speed
         dpitch = (int('u' in keys) - int('o' in keys)) * MAX_DELTA_ROT * speed
         dyaw = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
+        if self.rotation_input_frame == "eef":
+            dyaw = -dyaw
         return dx, dy, dz, droll, dpitch, dyaw
 
     def _get_ps4_delta(self) -> tuple[float, float, float, float, float, float]:
-        pygame.event.pump()
-        self._handle_ps4_buttons()
+        if not self._pygame_ready or self._joystick is None:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        try:
+            pygame.event.pump()
+        except pygame.error:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        if not self._handle_ps4_buttons():
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         speed = self.step_size
 
         left_x = self._read_axis(PS4_AXIS_LEFT_X)
@@ -375,6 +441,8 @@ class KeyboardController:
         droll = (l1 - r1) * MAX_DELTA_ROT * speed
         dpitch = (l2 - r2) * MAX_DELTA_ROT * speed
         dyaw = right_x * MAX_DELTA_ROT * speed
+        if self.rotation_input_frame == "eef":
+            dyaw = -dyaw
         return dx, dy, dz, droll, dpitch, dyaw
 
     def _get_input_delta(self) -> tuple[float, float, float, float, float, float]:
@@ -385,7 +453,7 @@ class KeyboardController:
     def _convert_local_rot_delta_to_base(
         self,
         local_rot_delta: np.ndarray,
-        state: np.ndarray | None,
+        commanded_pose: np.ndarray | None,
     ) -> np.ndarray:
         """将末端系旋转增量转换为基座系 rotvec。
 
@@ -396,10 +464,10 @@ class KeyboardController:
         if np.linalg.norm(local_rot_delta) < 1e-12:
             return local_rot_delta.copy()
 
-        if state is None or state.shape[0] < 6:
+        if commanded_pose is None or commanded_pose.shape[0] < 6:
             current_rot = np.eye(3, dtype=np.float64)
         else:
-            current_rot = Rotation.from_rotvec(state[3:6]).as_matrix()
+            current_rot = Rotation.from_rotvec(commanded_pose[3:6]).as_matrix()
 
         delta_local = Rotation.from_rotvec(local_rot_delta).as_matrix()
         delta_base = current_rot @ delta_local @ current_rot.T
@@ -408,13 +476,13 @@ class KeyboardController:
     def _convert_rot_delta_to_base(
         self,
         rot_delta: np.ndarray,
-        state: np.ndarray | None,
+        commanded_pose: np.ndarray | None,
     ) -> np.ndarray:
         """将输入设备旋转增量统一转换为基座系 rotvec。"""
         rot_delta = np.asarray(rot_delta, dtype=np.float64)
         if self.rotation_input_frame == "base":
             return rot_delta.copy()
-        return self._convert_local_rot_delta_to_base(rot_delta, state)
+        return self._convert_local_rot_delta_to_base(rot_delta, commanded_pose)
 
     # ------------------------------------------------------------------
     # 输入线程
@@ -428,18 +496,31 @@ class KeyboardController:
         droll: float,
         dpitch: float,
         dyaw: float,
-        state: np.ndarray | None,
+        commanded_pose: np.ndarray | None,
     ) -> np.ndarray:
         delta_rot_base = self._convert_rot_delta_to_base(
             np.array([droll, dpitch, dyaw], dtype=np.float64),
-            state,
+            commanded_pose,
         )
         action = np.array(
             [dx, dy, dz, *delta_rot_base.tolist(), 0.0],
             dtype=np.float64,
         )
-        action[6] = 1.0 if self.gripper_target < 0.04 else -1.0
+        action[6] = 1.0 if self.gripper_target <= 0.0 else -1.0
         return action
+
+    def _apply_action_to_pose_array(self, pose: np.ndarray, action: np.ndarray) -> np.ndarray:
+        """按执行语义将 action[:6] 积分到 commanded pose 上。"""
+        next_pose = np.asarray(pose, dtype=np.float64).copy()
+        delta = np.asarray(action[:6], dtype=np.float64)
+        next_pose[:3] += delta[:3]
+
+        angle = np.linalg.norm(delta[3:6])
+        if angle > 1e-6:
+            delta_rot = Rotation.from_rotvec(delta[3:6]).as_matrix()
+            current_rot = Rotation.from_rotvec(next_pose[3:6]).as_matrix()
+            next_pose[3:6] = Rotation.from_matrix(delta_rot @ current_rot).as_rotvec()
+        return next_pose
 
     def _input_loop(self):
         """10Hz 输入采样线程。
@@ -455,15 +536,23 @@ class KeyboardController:
         while self.running and not self._stop_event.is_set():
             loop_start = time.perf_counter()
             state = self.env.get_robot_state_vector()
+            joint_state = self.env.get_joint_state_vector()
+            with self._state_lock:
+                commanded_pose = self._logged_commanded_pose.copy()
             dx, dy, dz, droll, dpitch, dyaw = self._get_input_delta()
-            action = self._build_action(dx, dy, dz, droll, dpitch, dyaw, state)
-            self._latest_action = action.copy()
+            action = self._build_action(dx, dy, dz, droll, dpitch, dyaw, commanded_pose)
+            next_commanded_pose = self._apply_action_to_pose_array(commanded_pose, action)
+            with self._state_lock:
+                self._latest_state = state.copy()
+                self._latest_joint_state = joint_state.copy()
+                self._latest_commanded_pose = commanded_pose.copy()
+                self._latest_action = action.copy()
+                self._logged_commanded_pose = next_commanded_pose
             self.env.enqueue_action(
                 action,
                 transform=False,
                 latest_only=True,
             )
-            self._latest_state = state.copy()
 
             next_tick += INPUT_DT
             now = time.perf_counter()
@@ -489,10 +578,6 @@ class KeyboardController:
         print("  [夹爪] 打开")
         self.gripper_target = 0.08
 
-    def _half_gripper(self):
-        print("  [夹爪] 半开 (0.04m)")
-        self.gripper_target = 0.04
-
     def _reset(self):
         """通过 FrankaEnv 串行执行 home + restart，避免和 skill loop 抢接口。"""
         if not self._reset_lock.acquire(blocking=False):
@@ -503,8 +588,25 @@ class KeyboardController:
             print("  [复位] 回到初始位姿...")
             self.gripper_target = 0.08
             self.env.home_and_restart()
-            self._latest_state = self.env.get_robot_state_vector()
-            self._latest_action = self._build_action(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self._latest_state)
+            latest_state = self.env.get_robot_state_vector()
+            latest_joint_state = self.env.get_joint_state_vector()
+            latest_commanded_pose = self.env.commanded_pose_array.copy()
+            latest_action = self._build_action(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                latest_commanded_pose,
+            )
+            with self._state_lock:
+                self._latest_state = latest_state
+                self._latest_joint_state = latest_joint_state
+                self._latest_commanded_pose = latest_commanded_pose
+                self._latest_action = latest_action
+                self._logged_commanded_pose = latest_commanded_pose.copy()
+            self.rumble(0.2, 0.8, 120)
             print("  [复位] 完成")
         except Exception:
             logging.exception("复位失败")
@@ -524,4 +626,24 @@ class KeyboardController:
 
         action 为当前 10Hz 输入采样拍送入 FrankaEnv 的动作。
         """
-        return self._latest_state.copy(), self._latest_action.copy()
+        with self._state_lock:
+            return self._latest_state.copy(), self._latest_action.copy()
+
+    def get_recording_snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """返回用于录制的 env 执行快照。
+
+        返回值依次为：
+        - state: (8,)
+        - joint_state: (7,)
+        - commanded_pose: (6,)
+        - action: (7,)
+        """
+        state = self.env.get_robot_state_vector()
+        joint_state = self.env.get_joint_state_vector()
+        action, commanded_pose = self.env.get_executed_control_snapshot()
+        return (
+            state.copy(),
+            joint_state.copy(),
+            commanded_pose.copy(),
+            action.copy(),
+        )

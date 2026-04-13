@@ -4,7 +4,7 @@
 # 用法：
 #   ./start_trajectory_replay.sh --episode collected/simple_pick_place/epo_9
 #   ./start_trajectory_replay.sh --episode /root/Documents/my_code/vla4desk/collected/simple_pick_place/epo_9
-#   ./start_trajectory_replay.sh --task simple_pick_place --epo 21
+#   ./start_trajectory_replay.sh --task default --epo 14
 #   ./start_trajectory_replay.sh --task simple_pick_place --epo 1 --speed 2.0
 #   ./start_trajectory_replay.sh --episode collected/simple_pick_place/epo_1 --no_robot
 #

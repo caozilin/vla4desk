@@ -52,12 +52,17 @@ INTERP_STEPS = int(CONTROL_DT / INTERP_DT)  # = 5
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 15
+DEFAULT_CAM1_SERIAL = "346222072769"
+DEFAULT_CAM2_SERIAL = "938422075745"
+D435_START_RETRIES = 5
+D435_START_RETRY_DELAY = 0.5
 
 POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
 ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
 POS_MAX_VEL = 0.1 / 3      # 末端位置最大速度 (m/s)
 ROT_MAX_VEL = (math.pi / 4) / 3   # 末端旋转最大速度 (rad/s)
 GRIPPER_SPEED = 0.08    # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
+GRIPPER_WIDTH_MAX = 0.08
 POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
 ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
 
@@ -71,7 +76,7 @@ def transform_action(action: np.ndarray) -> np.ndarray:
     ta = action.copy()
     ta[:3] = np.clip(ta[:3], -POS_CLIP, POS_CLIP) * POS_SCALE
     ta[3:6] = np.clip(ta[3:6], -ROT_CLIP, ROT_CLIP) * ROT_SCALE
-    ta[6] = 0.0 if ta[6] >= 0 else 0.08
+    ta[6] = 0.0 if ta[6] >= 0 else GRIPPER_WIDTH_MAX
     return ta
 
 
@@ -95,7 +100,7 @@ def _apply_action_transform(
         rot_scale = config.rot_max_vel * CONTROL_DT / config.rot_clip
         ta[:3] = np.clip(ta[:3], -config.pos_clip, config.pos_clip) * pos_scale
         ta[3:6] = np.clip(ta[3:6], -config.rot_clip, config.rot_clip) * rot_scale
-    ta[6] = 0.0 if ta[6] >= 0 else 0.08
+    ta[6] = 0.0 if ta[6] >= 0 else GRIPPER_WIDTH_MAX
     return ta
 
 
@@ -119,18 +124,51 @@ class D435Camera:
         self._stop_event = threading.Event()
         self._reader_thread: threading.Thread | None = None
 
+    def _release_pipeline(self):
+        pipeline = self._pipeline
+        self._pipeline = None
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+
     def start(self):
         if not HAS_REALSENSE:
             raise RuntimeError("pyrealsense2 未安装，无法启动相机")
-        config = rs.config()
-        if self._serial:
-            config.enable_device(self._serial)
-        config.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
-        self._pipeline = rs.pipeline()
-        self._pipeline.start(config)
-        self._stop_event.clear()
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+        if self._pipeline is not None:
+            self.stop()
+
+        last_error: Exception | None = None
+        for attempt in range(1, D435_START_RETRIES + 1):
+            pipeline = rs.pipeline()
+            try:
+                config = rs.config()
+                if self._serial:
+                    config.enable_device(self._serial)
+                config.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
+                pipeline.start(config)
+                self._pipeline = pipeline
+                self._stop_event.clear()
+                self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+                self._reader_thread.start()
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "相机 %s 启动失败（第 %d/%d 次）: %s",
+                    self._serial or "<auto>",
+                    attempt,
+                    D435_START_RETRIES,
+                    e,
+                )
+                self._release_pipeline()
+                if attempt < D435_START_RETRIES:
+                    time.sleep(D435_START_RETRY_DELAY)
+
+        raise RuntimeError(
+            f"相机 {self._serial or '<auto>'} 启动失败，已重试 {D435_START_RETRIES} 次: {last_error}"
+        )
 
     def _reader_loop(self):
         while not self._stop_event.is_set() and self._pipeline is not None:
@@ -144,6 +182,8 @@ class D435Camera:
                     self._latest_frame = frame.copy()
             except Exception as e:
                 logger.warning(f"相机读帧失败，将保持上一帧缓存：{e}")
+                self._stop_event.set()
+                self._release_pipeline()
                 break
 
     def get_frame(self) -> np.ndarray:
@@ -152,12 +192,14 @@ class D435Camera:
 
     def stop(self):
         self._stop_event.set()
-        if self._reader_thread is not None and self._reader_thread.is_alive():
+        if (
+            self._reader_thread is not None
+            and self._reader_thread.is_alive()
+            and threading.current_thread() is not self._reader_thread
+        ):
             self._reader_thread.join(timeout=1.0)
         self._reader_thread = None
-        if self._pipeline is not None:
-            self._pipeline.stop()
-            self._pipeline = None
+        self._release_pipeline()
 
 
 class DualD435:
@@ -174,6 +216,7 @@ class DualD435:
                 cam.start()
             except Exception as e:
                 logger.warning(f"相机启动失败，将使用全黑帧：{e}")
+            time.sleep(0.2)
 
     def stop(self):
         for cam in (self._cam1, self._cam2):
@@ -258,8 +301,8 @@ class FrankaEnv:
 
     def __init__(
         self,
-        cam1_serial: str | None = None,
-        cam2_serial: str | None = None,
+        cam1_serial: str | None = DEFAULT_CAM1_SERIAL,
+        cam2_serial: str | None = DEFAULT_CAM2_SERIAL,
         dynamic_duration: float = 60.0,
         no_robot: bool = False,
         pos_clip: float = POS_CLIP,
@@ -295,12 +338,17 @@ class FrankaEnv:
         self._cached_pose: np.ndarray | None = None  # [pos(3), rot_axisangle(3)]
         self._cached_joints: np.ndarray | None = None  # (7,)
         self._cached_gripper_width: float | None = None  # 单指开口(m)
-        
+
         # 末端力矩缓存：[force(3), torque(3)]，单位 [N, Nm]
         self._cached_ee_force_torque: np.ndarray | None = None  # (6,)
-        
+
+        # 最近一次被执行线程真正采用的控制快照
+        self._executed_action = np.zeros(7, dtype=np.float64)
+        self._executed_commanded_pose = np.zeros(6, dtype=np.float64)
+
         # 旋转矢量历史缓存：存原始 rotvec，供 normalize_rotvec_with_history 做跨帧连续化
         self._prev_rotvec: np.ndarray | None = None
+        self._prev_commanded_rotvec: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -358,8 +406,17 @@ class FrankaEnv:
         if rot_max_vel is not None:
             self._action_transform.rot_max_vel = rot_max_vel
 
-    def transform_action(self, action: np.ndarray, *, scale_motion: bool = True) -> np.ndarray:
-        return _apply_action_transform(action, self._action_transform, scale_motion=scale_motion)
+    def transform_action(
+        self,
+        action: np.ndarray,
+        *,
+        scale_motion: bool = True,
+    ) -> np.ndarray:
+        return _apply_action_transform(
+            action,
+            self._action_transform,
+            scale_motion=scale_motion,
+        )
 
     def _resize_observation_image(self, image: np.ndarray) -> np.ndarray:
         return image_tools.convert_to_uint8(image_tools.resize_with_pad(image, RESIZE, RESIZE))
@@ -368,8 +425,10 @@ class FrankaEnv:
         return Rotation.from_matrix(pose.rotation).as_rotvec()
 
     def _set_commanded_pose_array(self, pose: "RigidTransform"):
-        rot_vec = normalize_rotvec(self._pose_to_rotvec(pose))
+        raw_rot_vec = self._pose_to_rotvec(pose)
+        rot_vec = normalize_rotvec_with_history(raw_rot_vec, self._prev_commanded_rotvec)
         self._commanded_pose_array = np.concatenate([pose.translation, rot_vec])
+        self._prev_commanded_rotvec = rot_vec.copy()
 
     def _read_robot_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         with self._fa_api_lock:
@@ -455,6 +514,9 @@ class FrankaEnv:
             )
             init_time = fa.get_time()
         self._set_commanded_pose_array(current_pose)
+        with self._lock:
+            self._executed_commanded_pose = self._commanded_pose_array.copy()
+            self._executed_action = np.zeros(7, dtype=np.float64)
         logger.info("dynamic skill 就绪，开始接收 action")
         return current_pose.copy(), init_time
 
@@ -466,15 +528,16 @@ class FrankaEnv:
 
     def _resolve_goal_pose(self, commanded_pose: "RigidTransform", action):
         if action is None:
-            return commanded_pose, commanded_pose, None
+            return commanded_pose, commanded_pose, None, None
 
         should_transform = True
         if isinstance(action, tuple):
             action, should_transform = action
 
-        transformed_action = self.transform_action(action, scale_motion=should_transform)
+        raw_action = np.asarray(action, dtype=np.float64).copy()
+        transformed_action = self.transform_action(raw_action, scale_motion=should_transform)
         goal_pose = self._compute_target_pose(commanded_pose, transformed_action[:6])
-        return commanded_pose, goal_pose, transformed_action
+        return commanded_pose, goal_pose, transformed_action, raw_action
 
     def _maybe_update_gripper(
         self,
@@ -485,9 +548,17 @@ class FrankaEnv:
         gripper_target = action[6]
         if last_gripper is None or gripper_target != last_gripper:
             with self._fa_api_lock:
-                fa.goto_gripper(gripper_target, block=False, speed=GRIPPER_SPEED)
+                if gripper_target <= 0.0:
+                    fa.close_gripper(grasp=True, block=False)
+                else:
+                    fa.open_gripper(block=False)
             return gripper_target
         return last_gripper
+
+    def _set_executed_control_snapshot(self, raw_action: np.ndarray):
+        with self._lock:
+            self._executed_action = np.asarray(raw_action, dtype=np.float64).copy()
+            self._executed_commanded_pose = self._commanded_pose_array.copy()
 
     def _publish_interp_pose(
         self,
@@ -576,8 +647,11 @@ class FrankaEnv:
     # obs 采集
     # ------------------------------------------------------------------
 
+    def get_camera_frames(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._cameras.get_frames()
+
     def get_observation(self, prompt: str) -> dict:
-        img1, img2 = self._cameras.get_frames()
+        img1, img2 = self.get_camera_frames()
 
         img1_resized = self._resize_observation_image(img1)
         img2_resized = self._resize_observation_image(img2)
@@ -609,6 +683,7 @@ class FrankaEnv:
             self._skill_stop.clear()
             # 重置历史旋转矢量，避免从旧的缓存开始导致奇异性处理错误
             self._prev_rotvec = None
+            self._prev_commanded_rotvec = None
             self._skill_thread = threading.Thread(
                 target=self._skill_loop, daemon=True
             )
@@ -655,11 +730,12 @@ class FrankaEnv:
                 if action is None and self._skill_stop.is_set():
                     break
 
-                start_pose, goal_pose, transformed_action = self._resolve_goal_pose(commanded_pose, action)
+                start_pose, goal_pose, transformed_action, raw_action = self._resolve_goal_pose(commanded_pose, action)
                 commanded_pose = goal_pose
                 self._set_commanded_pose_array(commanded_pose)
 
                 if transformed_action is not None:
+                    self._set_executed_control_snapshot(raw_action)
                     last_gripper = self._maybe_update_gripper(fa, transformed_action, last_gripper)
 
                 msg_id = self._publish_interp_pose(
@@ -712,6 +788,11 @@ class FrankaEnv:
     @property
     def commanded_pose_array(self) -> np.ndarray:
         return self._commanded_pose_array
+
+    def get_executed_control_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
+        """返回最近一次被执行线程真正采用的 (action, commanded_pose)。"""
+        with self._lock:
+            return self._executed_action.copy(), self._executed_commanded_pose.copy()
 
     @property
     def ee_force_torque(self) -> np.ndarray:

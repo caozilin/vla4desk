@@ -37,7 +37,7 @@ start_data_collector.sh
   - 以 10Hz 采样 `state/action`
   - 仅在“action 近零且 state 与上一条已录制 state 基本一致”时跳过
   - 在录制开启时缓存图像和数据
-  - 保存为 `cam1.mp4`、`cam2.mp4`、`data.csv`
+  - 保存为 `cam1.mp4`、`cam2.mp4`、`data.json`
 
 ---
 
@@ -76,7 +76,7 @@ start_data_collector.sh
 
 - 平移：`W/S`、`A/D`、`I/K`
 - 旋转：`Q/E`、`U/O`、`J/L`
-- 夹爪：`G` 关闭，`H` 打开，`F` 半开
+- 夹爪：`G` 关闭，`H` 打开
 - 速度档位：`+` / `-`
 - 复位：`R`
 - 录制：`1` 开始，`2` 结束
@@ -104,14 +104,13 @@ dyaw = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
 - 右摇杆：`Z` 平移和 `Yaw`
 - `L1/R1`：`Roll`
 - `L2/R2`：`Pitch`
-- `方块`：关闭夹爪
-- `圆圈`：打开夹爪
-- `三角`：半开夹爪
+- `三角`：打开夹爪
+- `圆圈`：关闭夹爪
+- `方块`：复位
 - 十字键左右：速度档位减/加
-- `OPTIONS`：复位
+- `OPTIONS`：退出
 - `L3`：开始录制
 - `R3`：结束录制
-- `PS`：退出
 
 代码里使用的轴/按钮编号：
 
@@ -123,15 +122,15 @@ PS4_AXIS_RIGHT_X = 3
 PS4_AXIS_RIGHT_Y = 4
 PS4_AXIS_R2 = 5
 
-PS4_BUTTON_SQUARE = 0
-PS4_BUTTON_CIRCLE = 2
-PS4_BUTTON_TRIANGLE = 3
+PS4_BUTTON_CROSS = 0
+PS4_BUTTON_CIRCLE = 1
+PS4_BUTTON_TRIANGLE = 2
+PS4_BUTTON_SQUARE = 3
 PS4_BUTTON_L1 = 4
 PS4_BUTTON_R1 = 5
 PS4_BUTTON_OPTIONS = 9
-PS4_BUTTON_L3 = 10
-PS4_BUTTON_R3 = 11
-PS4_BUTTON_PS = 12
+PS4_BUTTON_L3 = 11
+PS4_BUTTON_R3 = 12
 ```
 
 不同系统的 SDL 映射可能略有差异。如果实机按键不对，优先修改 `key_control.py` 顶部这些常量。
@@ -167,7 +166,7 @@ MAX_DELTA_ROT = MAX_ROT_VEL * INPUT_DT   # 0.0785 rad
 _speed_levels = [0.4, 0.7, 1.0]
 ```
 
-默认是 `0.7` 档。
+默认是 `1.0` 档。
 
 键盘和 PS4 共用同一套：
 
@@ -202,9 +201,9 @@ state = [pos(3), rotvec(3), finger1(1), finger2(1)]
 - `state[3:6]`
   末端姿态的旋转向量 `Rotation.from_matrix(...).as_rotvec()`
 - `state[6]`
-  当前夹爪宽度的一半
+  `finger1`，当前定义为夹爪宽度的一半
 - `state[7]`
-  当前夹爪宽度负的一半
+  `finger2`，当前定义为 `-finger1`
 
 代码实现：
 
@@ -272,7 +271,7 @@ else:
 - `1.0` 表示闭合意图
 - `-1.0` 表示打开意图
 
-半开 `0.04m` 也会被编码为“打开意图”。
+当前夹爪控制只有关闭/打开两档，不再保留半开语义。
 
 ---
 
@@ -382,7 +381,7 @@ if self._is_action_empty(action) and self._is_state_same_as_last_recorded(state)
 
 这意味着：
 
-- 纯静止帧不会写入 `data.csv`
+- 纯静止帧不会写入 `data.json`
 - 即使 `action` 近零，只要当前 `state` 与上一条已录制样本有明显差异，仍然会记录
 - 当前 `_is_action_empty()` 仍然不检查 `action[6]`，所以夹爪-only 的过滤行为最终还取决于 `state` 是否变化
 
@@ -398,7 +397,7 @@ collected/
     epo_1/
       cam1.mp4
       cam2.mp4
-      data.csv
+      data.json
     epo_2/
       ...
 ```
@@ -412,30 +411,35 @@ episode 编号按 `epo_N` 自动递增。
 
 由 `imageio.mimwrite(..., codec="libx264", pixelformat="yuv420p")` 保存，帧率等于 `collect_hz`。
 
-### CSV
+### JSON
 
-`data.csv` 结构：
-
-1. 第 1 行：单列 JSON 元数据
-2. 第 2 行：表头
-3. 第 3 行起：每行 `8 + 7 = 15` 个数值
-
-第 1 行元数据字段：
+`data.json` 顶层结构：
 
 ```json
 {
   "task_name": "...",
   "collect_hz": 10.0,
   "max_frames": 1000,
-  "num_frames": 123
+  "num_frames": 123,
+  "action_scale": 100.0,
+  "prompt": "",
+  "frames": [
+    {
+      "state": [...],
+      "joint_state": [...],
+      "action": [...],
+      "commanded_pose": [...]
+    }
+  ]
 }
 ```
 
-第 2 行列名：
+逐帧字段：
 
-```text
-state_0 ... state_7 action_0 ... action_6
-```
+- `state`: `(8,)`
+- `joint_state`: `(7,)`
+- `action`: `(7,)`
+- `commanded_pose`: `(6,)`
 
 ---
 

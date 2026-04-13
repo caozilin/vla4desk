@@ -13,6 +13,7 @@ import sys
 import time
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -40,9 +41,14 @@ def _load_episode_json(json_path: pathlib.Path) -> tuple[dict, list[dict[str, li
 
 
 def _decode_stored_action(action: list[float], action_scale: float) -> np.ndarray:
-    """从 JSON 读取 action：仅还原前 6 维，夹爪维度保持原值。"""
+    """从 JSON 读取 action：还原前 6 维，并兼容旧版宽度式夹爪记录。"""
     decoded = np.asarray(action, dtype=np.float64).copy()
     decoded[:6] /= action_scale
+    if decoded.shape[0] >= 7:
+        if 0.0 <= decoded[6] <= 0.08:
+            decoded[6] = 1.0 if decoded[6] <= 0.0 else -1.0
+        else:
+            decoded[6] = 1.0 if decoded[6] >= 0.0 else -1.0
     return decoded
 
 
@@ -130,11 +136,24 @@ class TrajectoryReplayRecorder:
         self.prompt = prompt
         self.logged_rows: list[dict[str, list[float]]] = []
         self.no_robot = no_robot
+        self._logged_commanded_pose = np.zeros(6, dtype=np.float64)
         self.env = FrankaEnv(
             cam1_serial=cam1_serial,
             cam2_serial=cam2_serial,
             no_robot=no_robot,
         )
+
+    def _apply_action_to_pose_array(self, pose: np.ndarray, action: np.ndarray) -> np.ndarray:
+        next_pose = np.asarray(pose, dtype=np.float64).copy()
+        delta = np.asarray(action[:6], dtype=np.float64)
+        next_pose[:3] += delta[:3]
+
+        angle = np.linalg.norm(delta[3:6])
+        if angle > 1e-6:
+            delta_rot = Rotation.from_rotvec(delta[3:6]).as_matrix()
+            current_rot = Rotation.from_rotvec(next_pose[3:6]).as_matrix()
+            next_pose[3:6] = Rotation.from_matrix(delta_rot @ current_rot).as_rotvec()
+        return next_pose
 
     def _prepare_env(self):
         self.env.start()
@@ -142,21 +161,36 @@ class TrajectoryReplayRecorder:
             logging.info("回放前复位到 home...")
             self.env.reset_to_home()
         self.env.start_skill_thread()
-        time.sleep(1.0)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if not np.allclose(self.env.commanded_pose_array, 0.0):
+                break
+            time.sleep(0.05)
+        commanded_pose = self.env.commanded_pose_array.copy()
+        if not np.allclose(commanded_pose, 0.0):
+            self._logged_commanded_pose = commanded_pose.astype(np.float64)
+            return
 
-    def _record_sample(self, sample: dict[str, list[float]]):
-        obs, _, _ = self.env.get_observation(self.prompt)
-        state = obs["observation/state"].astype(np.float64).tolist()
-        joint_state = obs["observation/joints"].astype(np.float64).tolist()
-        action = _decode_stored_action(sample["action"], self.action_scale)
+        state = self.env.get_robot_state_vector().astype(np.float64)
+        if not np.allclose(state[:6], 0.0):
+            self._logged_commanded_pose = state[:6].copy()
+            return
+
+        self._logged_commanded_pose = commanded_pose.astype(np.float64)
+
+    def _record_sample(self, action: np.ndarray):
+        state = self.env.get_robot_state_vector().astype(np.float64).tolist()
+        joint_state = self.env.get_joint_state_vector().astype(np.float64).tolist()
+        executed_action, executed_commanded_pose = self.env.get_executed_control_snapshot()
         self.logged_rows.append(
             {
+                "id": len(self.logged_rows),
                 "state": state,
                 "joint_state": joint_state,
-                "action": _encode_action_for_storage(action, self.action_scale),
+                "action": _encode_action_for_storage(executed_action, self.action_scale),
+                "commanded_pose": executed_commanded_pose.astype(np.float64).tolist(),
             }
         )
-        self.env.enqueue_action(action, transform=False)
 
     def _sleep_until(self, next_tick: float):
         remaining = next_tick - time.monotonic()
@@ -193,9 +227,11 @@ class TrajectoryReplayRecorder:
         try:
             next_tick = time.monotonic()
             for index, sample in enumerate(self.samples, start=1):
-                self._record_sample(sample)
+                action = _decode_stored_action(sample["action"], self.action_scale)
+                self.env.enqueue_action(action, transform=False)
                 next_tick += self.dt
                 self._sleep_until(next_tick)
+                self._record_sample(action)
 
                 if index % max(1, int(round(self.replay_hz))) == 0 or index == len(self.samples):
                     logging.info("回放进度: %d / %d", index, len(self.samples))
