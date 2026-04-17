@@ -20,7 +20,7 @@
 启动链路：
 
 ```text
-start_data_collector.sh
+start_vla4desk_data_collector.sh
   -> python data_recorder.py
       -> KeyboardController(input_device=...)
       -> DataRecorder(...)
@@ -48,21 +48,21 @@ start_data_collector.sh
 默认输入设备是键盘：
 
 ```bash
-./start_data_collector.sh
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh
 ```
 
 默认 `task_name` 是 `default`。如果希望直接写到以前常用的任务目录名，可以显式传：
 
 ```bash
-./start_data_collector.sh --task_name simple_pick_place
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh --task_name simple_pick_place
 ```
 
 也可以显式指定：
 
 ```bash
-./start_data_collector.sh --input_device keyboard
-./start_data_collector.sh --input_device ps4
-./start_data_collector.sh --input_device ps4 --joystick_index 0
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh --input_device keyboard
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh --input_device ps4
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh --input_device ps4 --joystick_index 0
 ```
 
 对应参数来自 `data_recorder.py`：
@@ -111,7 +111,7 @@ dyaw = (int('l' in keys) - int('j' in keys)) * MAX_DELTA_ROT * speed
 - 十字键左右：速度档位减/加
 - `OPTIONS`：退出
 - `L3`：开始录制
-- `R3`：结束录制
+- `R3`：结束录制并在保存后自动复位
 
 代码里使用的轴/按钮编号：
 
@@ -294,7 +294,7 @@ def transform_action(action):
 ```python
 CONTROL_DT = 0.1
 POS_CLIP = 1.0
-ROT_CLIP = 0.1
+ROT_CLIP = 6.0
 POS_MAX_VEL = 0.1 / 3
 ROT_MAX_VEL = (math.pi / 4) / 3
 POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
@@ -455,6 +455,62 @@ episode 编号按 `epo_N` 自动递增。
 - `action`: `(7,)`
 - `commanded_pose`: `(6,)`
 
+### 批量写入 Prompt
+
+可以用 `src/data_collection/write_prompts_to_json.py` 把多行 prompt 批量写入某个任务目录下的所有 JSON 顶层 `prompt` 字段。
+
+- 默认读取对应任务目录里的 `prompts.txt`
+- 固定写入该任务目录下各 episode 的 `data.json`
+- `prompts.txt` 按行提供 prompt，空行会被忽略
+- JSON 文件按路径排序后依次写入
+- 如果 prompt 数量少于 JSON 数量，会循环复用
+- 如果 prompt 数量多于 JSON 数量，多出的不会使用
+
+推荐在宿主机直接执行 Docker 包装脚本：
+
+```sh
+./start_write_prompts_to_json.sh collected/simple_pick_place
+```
+
+这个脚本会在容器 `franka` 内运行：
+
+```sh
+python -B src/data_collection/write_prompts_to_json.py collected/simple_pick_place
+```
+
+参数说明：
+
+- 只需要一个参数：目标任务目录，例如 `collected/simple_pick_place`
+- 程序固定读取 `<task-dir>/prompts.txt`
+- 程序固定递归查找并写入 `<task-dir>` 下的 `data.json`
+- 或者使用 `--fill-empty-under-collected collected` 遍历整个 `collected`
+
+Docker 路径约定：
+
+- 推荐直接传容器内仓库相对路径，如 `collected/...`、`src/data_collection/...`
+- 也可以传容器内绝对路径，如 `/workspace/franka_my_code/vla4desk/collected/...`
+- 不要传宿主机绝对路径，如 `/media/...`
+
+示例：
+
+```bash
+python -B src/data_collection/write_prompts_to_json.py collected/simple_pick_place
+```
+
+如果要遍历整个 `collected`，并且只给空 prompt 补写：
+
+```bash
+python -B src/data_collection/write_prompts_to_json.py \
+  --fill-empty-under-collected collected
+```
+
+这个模式的行为：
+
+- 遍历 `collected` 下所有带 `prompts.txt` 的任务目录
+- 每个任务目录都读取自己的 `<task-dir>/prompts.txt`
+- 只处理 `prompt == ""` 的 `data.json`
+- prompt 轮换规则仍然是按路径排序后循环复用，但作用范围是“该任务目录下待补写的空 prompt JSON”
+
 ---
 
 ## 相机行为
@@ -491,31 +547,31 @@ episode 编号按 `epo_N` 自动递增。
 默认启动：
 
 ```bash
-cd /media/czl/sata/franka_my_code/vla4desk
-./start_data_collector.sh
+cd /home/k324/franka_my_code/vla4desk
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh
 ```
 
 指定任务名：
 
 ```bash
-./start_data_collector.sh --task_name simple_pick_place
-./start_data_collector.sh --task_name pick_place
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh --task_name simple_pick_place
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh --task_name pick_place
 ```
 
 使用 PS4：
 
 ```bash
-./start_data_collector.sh --input_device ps4
+/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh --input_device ps4
 ```
 
 手动启动：
 
 ```bash
-cd /root/Documents/my_code/vla4desk/src/data_collection
+cd /workspace/franka_my_code/vla4desk/src/data_collection
 python data_recorder.py --task_name my_task --input_device ps4 --joystick_index 0
 ```
 
-注意：`start_data_collector.sh` 是在容器里执行 `/root/Documents/my_code/vla4desk/...`，而仓库宿主机路径是 `/media/czl/sata/franka_my_code/vla4desk`，两者都是真实存在的启动路径，只是所处环境不同。
+注意：`start_vla4desk_data_collector.sh` 会先启动 `franka_vla4desk` 容器，再在容器里执行 `/workspace/franka_my_code/vla4desk/...`；宿主机仓库路径是 `/home/k324/franka_my_code/vla4desk`。
 
 ---
 
@@ -524,7 +580,7 @@ python data_recorder.py --task_name my_task --input_device ps4 --joystick_index 
 - `src/data_collection/key_control.py`
 - `src/data_collection/data_recorder.py`
 - `src/vla_control/franka_env.py`
-- `start_data_collector.sh`
+- `/home/k324/franka_my_code/vla4desk/start_vla4desk_data_collector.sh`
 - `requirements.txt`
 
 ---

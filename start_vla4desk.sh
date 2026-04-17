@@ -1,27 +1,24 @@
 #!/bin/bash
-# 轨迹复现 - 回放采集的轨迹
+# 启动 vla4desk 推理控制器
 #
 # 用法：
-#   ./start_trajectory_replay.sh --episode collected/simple_pick_place/epo_9
-#   ./start_trajectory_replay.sh --task final_clean --epo 1
-#   ./start_trajectory_replay.sh --task simple_pick_place --epo 1 --speed 2.0
-#   ./start_trajectory_replay.sh --episode collected/simple_pick_place/epo_1 --no_robot
-#   ./start_trajectory_replay.sh --episode collected/default/epo_15 --output_dir collected/default/replay_epo_15
-#   ./start_trajectory_replay.sh --task simple_pick_place --epo 1 --speed 1.5 --output_dir collected/simple_pick_place/replay_epo_1
+#   ./start_vla4desk.sh
+#   ./start_vla4desk.sh --no_robot
+#   ./start_vla4desk.sh --host 100.96.2.67 --port 8000
+#   ./start_vla4desk.sh --web_port 8080
+#   ./start_vla4desk.sh --host 100.96.2.67 --port 8000 --web_port 8081 --no_robot
 #
 # 参数说明：
-#   --episode <path>         指定 episode 路径（如: collected/simple_pick_place/epo_9）
-#   --task <name>            任务名称（与 --epo 配合使用）
-#   --epo <number>           episode 编号（与 --task 配合使用）
-#   --speed <multiplier>     回放速度倍数（默认: 1.0）
-#   --output_dir <path>      输出目录（用于重记录）
-#   --no_robot               不连接真实机器人（仿真模式）
+#   --no_robot             不连接真实机器人（仿真模式）
+#   --host <ip>            VLA 服务器 IP 地址（默认: localhost）
+#   --port <port>          VLA 服务器端口（默认: 8000）
+#   --web_port <port>      Web 界面端口（默认: 8080）
 #
 # 说明：
-#   - 回放之前采集的轨迹数据
-#   - 可以调整速度进行慢速或快速回放
-#   - 支持重记录功能（指定 --output_dir）
+#   - 启动 vla4desk 推理控制器，连接 VLA 模型进行视觉-语言-动作推理
+#   - 需要确保 franka 容器已启动并挂载了相机设备
 #   - 需要先启动 Franka 三件套（start_interface_triplet.sh）
+#   - 需要先启动 VLA 服务器（如 pi0、openpi 等）
 
 set -euo pipefail
 
@@ -73,8 +70,8 @@ docker exec -it \
     export PYTHONPATH=\"${FRANKAPY_PYTHONPATH}:\${PYTHONPATH:-}\"
     source /opt/ros/humble/setup.bash
     source ${WORKSPACE_ROOT}/franka-interface/install/setup.bash
-    cd ${WORKSPACE_ROOT}/vla4desk/src/data_collection
-    python trajectory_replay_recorder.py $*
+    cd ${WORKSPACE_ROOT}/vla4desk/src/vla_control
+    python coordinator.py $*
   "
 
 # 修复 collected 和 logs 文件夹权限

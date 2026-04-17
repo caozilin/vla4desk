@@ -39,6 +39,7 @@ from collections import deque
 import imageio
 import numpy as np
 from pynput import keyboard
+from scipy.spatial.transform import Rotation
 
 
 # ==================================================================
@@ -63,7 +64,7 @@ class DataRecorder:
     COLLECTION_DIR = pathlib.Path(__file__).parent.parent.parent / "collected"
     TASK_NAME = "default"
     COLLECT_HZ = 10.0  # 与 vla_control 保持一致
-    MAX_FRAMES = 1000
+    MAX_FRAMES = 3000
     ACTION_THRESH_POS = 0.0005    # m
     ACTION_THRESH_ROT = 0.005    # rad
     STATE_THRESH_POS = 0.0005    # m
@@ -126,6 +127,7 @@ class DataRecorder:
         self._last_recorded_state: np.ndarray | None = None
         self._gripper_force_record_frames = 0
         self._last_trace_seq = 0
+        self._status_peak_ee_force_torque = np.zeros(6, dtype=np.float64)
 
     def _scale_action_for_storage(self, action: np.ndarray) -> list[float]:
         """仅缩放位姿维度，夹爪命令保持 -1/1 原值。"""
@@ -154,7 +156,7 @@ class DataRecorder:
         print("  [录制] 开始 → 按 2 结束当前轨迹")
 
     def stop_recording(self):
-        """结束并保存当前轨迹。"""
+        """结束、保存当前轨迹，并在完成后自动复位。"""
         if not self.is_recording:
             print("  [录制] 当前没有在录制")
             return
@@ -169,6 +171,8 @@ class DataRecorder:
 
         if frames1:
             self._save_trajectory(frames1, frames2, data)
+            print("  [录制] 保存完成，自动复位")
+            self.kc.reset_to_home(open_gripper=True)
 
     def discard_recording(self):
         """作废当前轨迹，不落盘。"""
@@ -305,9 +309,9 @@ class DataRecorder:
         """主采集循环，在独立线程运行。"""
         self.running = True
         control_hint = (
-            "  1: 开始录制   2: 结束录制   3: 作废并复位   ESC: 退出"
+            "  1: 开始录制   2: 结束录制并复位   3: 作废并复位   ESC: 退出"
             if self.kc.input_device == "keyboard"
-            else "  L3: 开始录制   R3: 结束录制   Cross: 作废并复位   PS: 退出"
+            else "  L3: 开始录制   R3: 结束录制并复位   Cross: 作废并复位   PS: 退出"
         )
 
         print("\n" + "=" * 60)
@@ -335,6 +339,12 @@ class DataRecorder:
         self._on_exit()
 
     def _collect_frame(self):
+        current_ee_force_torque = np.abs(np.asarray(self.kc.env.ee_force_torque, dtype=np.float64))
+        self._status_peak_ee_force_torque = np.maximum(
+            self._status_peak_ee_force_torque,
+            current_ee_force_torque,
+        )
+
         traces = self.kc.get_recording_snapshots_since(self._last_trace_seq)
         if not traces:
             return
@@ -392,11 +402,23 @@ class DataRecorder:
         state, _ = self.kc.get_state_and_action()
         pos = state[:3]
         gripper = state[6] - state[7]
+        latest_trace = self.kc.get_recording_snapshot()
+        commanded_pose = np.asarray(latest_trace["commanded_pose"], dtype=np.float64)
+        pos_error_norm = float(np.linalg.norm(state[:3] - commanded_pose[:3]))
+        actual_rot = Rotation.from_rotvec(np.asarray(state[3:6], dtype=np.float64))
+        commanded_rot = Rotation.from_rotvec(np.asarray(commanded_pose[3:6], dtype=np.float64))
+        rot_error_norm = float(np.linalg.norm((commanded_rot * actual_rot.inv()).as_rotvec()))
+        ee_force_torque = self._status_peak_ee_force_torque.copy()
+        self._status_peak_ee_force_torque.fill(0.0)
         status = "REC" if self.is_recording else "IDLE"
         frames = len(self.recording_data) if self.is_recording else 0
 
         print(f"  [{status}] pos=({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f})  "
-              f"gripper={gripper:.3f}m  epi={self.stats['trajectories_saved']}  "
+              f"gripper={gripper:.3f}m  pos_err={pos_error_norm:.6f}  "
+              f"rot_err={rot_error_norm:.6f}  "
+              f"ft_max=({ee_force_torque[0]:.2f}, {ee_force_torque[1]:.2f}, {ee_force_torque[2]:.2f}, "
+              f"{ee_force_torque[3]:.2f}, {ee_force_torque[4]:.2f}, {ee_force_torque[5]:.2f})  "
+              f"epi={self.stats['trajectories_saved']}  "
               f"cur_frames={frames}")
 
     def _on_exit(self):
@@ -495,8 +517,7 @@ def main():
                 return
             if char == '3':
                 recorder.discard_recording()
-                kc._open_gripper()
-                kc._reset()
+                kc.reset_to_home(open_gripper=True)
                 return
             _orig_on_press(key)
 

@@ -1,27 +1,24 @@
 #!/bin/bash
-# 轨迹复现 - 回放采集的轨迹
+# 批量写入 prompt 到采集 JSON
 #
 # 用法：
-#   ./start_trajectory_replay.sh --episode collected/simple_pick_place/epo_9
-#   ./start_trajectory_replay.sh --task final_clean --epo 1
-#   ./start_trajectory_replay.sh --task simple_pick_place --epo 1 --speed 2.0
-#   ./start_trajectory_replay.sh --episode collected/simple_pick_place/epo_1 --no_robot
-#   ./start_trajectory_replay.sh --episode collected/default/epo_15 --output_dir collected/default/replay_epo_15
-#   ./start_trajectory_replay.sh --task simple_pick_place --epo 1 --speed 1.5 --output_dir collected/simple_pick_place/replay_epo_1
+#   ./start_write_prompts_to_json.sh collected/simple_pick_place
+#   ./start_write_prompts_to_json.sh collected/strawberry_on_place
+#   ./start_write_prompts_to_json.sh --fill-empty-under-collected collected
+#   ./start_write_prompts_to_json.sh collected/simple_pick_place --dry-run
+#   ./start_write_prompts_to_json.sh collected/simple_pick_place --prompt "pick up the banana and place it on the plate"
 #
 # 参数说明：
-#   --episode <path>         指定 episode 路径（如: collected/simple_pick_place/epo_9）
-#   --task <name>            任务名称（与 --epo 配合使用）
-#   --epo <number>           episode 编号（与 --task 配合使用）
-#   --speed <multiplier>     回放速度倍数（默认: 1.0）
-#   --output_dir <path>      输出目录（用于重记录）
-#   --no_robot               不连接真实机器人（仿真模式）
+#   <path>                   采集数据目录路径（如: collected/simple_pick_place）
+#   --fill-empty-under-collected <dir>  批量处理目录下的所有任务
+#   --dry-run                试运行，不实际写入文件
+#   --prompt <text>          指定 prompt 文本（覆盖现有 prompt）
 #
 # 说明：
-#   - 回放之前采集的轨迹数据
-#   - 可以调整速度进行慢速或快速回放
-#   - 支持重记录功能（指定 --output_dir）
-#   - 需要先启动 Franka 三件套（start_interface_triplet.sh）
+#   - 批量给采集 JSON 写入或补写 prompt
+#   - 支持从 prompts.txt 文件自动读取 prompt
+#   - 使用 --dry-run 可以先预览修改内容
+#   - 需要确保 franka 容器已启动
 
 set -euo pipefail
 
@@ -73,8 +70,8 @@ docker exec -it \
     export PYTHONPATH=\"${FRANKAPY_PYTHONPATH}:\${PYTHONPATH:-}\"
     source /opt/ros/humble/setup.bash
     source ${WORKSPACE_ROOT}/franka-interface/install/setup.bash
-    cd ${WORKSPACE_ROOT}/vla4desk/src/data_collection
-    python trajectory_replay_recorder.py $*
+    cd ${WORKSPACE_ROOT}/vla4desk
+    python -B src/data_collection/write_prompts_to_json.py $*
   "
 
 # 修复 collected 和 logs 文件夹权限

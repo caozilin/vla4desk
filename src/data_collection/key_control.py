@@ -282,14 +282,14 @@ class KeyboardController:
             print("  [控制] 键盘模式")
             print("  [控制] W/S:X  A/D:Y  I/K:Z  Q/E:Roll  U/O:Pitch  J/L:Yaw")
             print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
-            print("  [控制] G/H:夹爪  +/-:速度档位  R:复位  1/2/3:开始/结束/作废录制  ESC:退出")
+            print("  [控制] G/H:夹爪  +/-:速度档位  R:复位  1/2/3:开始/结束并复位/作废录制  ESC:退出")
             return
 
         print("  [控制] PS4 手柄模式")
         print("  [控制] 左摇杆:X/Y平移  右摇杆:Z平移/Yaw  L1/R1:Roll  L2/R2:Pitch")
         print(f"  [控制] 旋转输入坐标系: {self.rotation_input_frame}")
         print("  [控制] 三角/圆圈:打开/关闭夹爪  叉:作废并复位  方块:复位  十字键左右:速度档位")
-        print("  [控制] L3/R3:开始/结束录制  OPTIONS:退出")
+        print("  [控制] L3/R3:开始/结束录制并复位  OPTIONS:退出")
 
     def _emit_event(self, event_name: str):
         callback = self._event_callbacks.get(event_name)
@@ -375,11 +375,10 @@ class KeyboardController:
                     if button_idx == PS4_BUTTON_CROSS:
                         self.rumble(0.2, 0.75, 90)
                         self._emit_event("record_discard")
-                        self._open_gripper()
-                        self._reset()
+                        self.reset_to_home(open_gripper=True)
                         return self.running and not self._stop_event.is_set()
                     if button_idx == PS4_BUTTON_SQUARE:
-                        self._reset()
+                        self.reset_to_home(open_gripper=True)
                         return self.running and not self._stop_event.is_set()
                     if button_idx == PS4_BUTTON_L3:
                         self._emit_event("record_start")
@@ -515,6 +514,20 @@ class KeyboardController:
         action[6] = 1.0 if self.gripper_target <= 0.0 else -1.0
         return action
 
+    def _resolve_commanded_pose_for_input(self, state: np.ndarray) -> np.ndarray:
+        """优先使用 env 执行线程的 commanded_pose，避免输入侧本地积分漂移。"""
+        trace = self.env.get_latest_control_trace()
+        trace_commanded_pose = np.asarray(trace["commanded_pose"], dtype=np.float64)
+        if trace_commanded_pose.shape == (6,) and not np.allclose(trace_commanded_pose, 0.0):
+            return trace_commanded_pose.copy()
+
+        state = np.asarray(state, dtype=np.float64)
+        if state.shape[0] >= 6 and not np.allclose(state[:6], 0.0):
+            return state[:6].copy()
+
+        with self._state_lock:
+            return self._logged_commanded_pose.copy()
+
     def _apply_action_to_pose_array(self, pose: np.ndarray, action: np.ndarray) -> np.ndarray:
         """按执行语义将 action[:6] 积分到 commanded pose 上。"""
         next_pose = np.asarray(pose, dtype=np.float64).copy()
@@ -543,8 +556,7 @@ class KeyboardController:
             loop_start = time.perf_counter()
             state = self.env.get_robot_state_vector()
             joint_state = self.env.get_joint_state_vector()
-            with self._state_lock:
-                commanded_pose = self._logged_commanded_pose.copy()
+            commanded_pose = self._resolve_commanded_pose_for_input(state)
             dx, dy, dz, droll, dpitch, dyaw = self._get_input_delta()
             action = self._build_action(dx, dy, dz, droll, dpitch, dyaw, commanded_pose)
             next_commanded_pose = self._apply_action_to_pose_array(commanded_pose, action)
@@ -583,6 +595,12 @@ class KeyboardController:
     def _open_gripper(self):
         print("  [夹爪] 打开")
         self.gripper_target = 0.08
+
+    def reset_to_home(self, open_gripper: bool = True):
+        """公开复位接口，可选先将夹爪切到打开意图。"""
+        if open_gripper:
+            self._open_gripper()
+        self._reset()
 
     def _reset(self):
         """通过 FrankaEnv 串行执行 home + restart，避免和 skill loop 抢接口。"""

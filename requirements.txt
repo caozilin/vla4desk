@@ -1,7 +1,8 @@
 # openpi-client 依赖（代码位于 src/client/）
 dm-tree>=0.1.8
 msgpack>=1.0.5
-numpy>=1.22.4,<2.0.0
+msgpack-numpy>=0.4.8
+numpy>=1.22.4,<1.25.0
 pillow>=9.0.0
 tree>=0.2.4
 websockets>=11.0
@@ -14,6 +15,7 @@ opencv-python>=4.9.0
 imageio>=2.34.0
 imageio-ffmpeg>=0.4.9
 pygame>=2.5.0
+pynput>=1.7.6
 
 # 相机（D435 直连）
 pyrealsense2>=2.54.0

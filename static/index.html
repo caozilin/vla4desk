@@ -196,6 +196,7 @@
     border: 1px solid rgba(255,255,255,0.08);
   }
   .metrics-panel { display: grid; gap: 12px; }
+  .metrics-stack { display: grid; gap: 12px; }
   .metric-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -217,6 +218,10 @@
     margin-top: 6px;
     color: var(--muted);
     font-size: 0.78rem;
+  }
+  .metric-block {
+    display: grid;
+    gap: 10px;
   }
   .telemetry-section {
     display: grid;
@@ -334,113 +339,78 @@
           <label>Wrist Camera</label>
           <img id="img2" alt="cam2">
         </div>
-        <div class="tele-box">
-          <label>Loop Timing</label>
-          <div class="tele-row"><span class="tele-key">Infer</span><span class="tele-val" id="tele-infer-ms">--</span></div>
-          <div class="tele-row"><span class="tele-key">Total</span><span class="tele-val" id="tele-total-ms">--</span></div>
-          <div class="tele-row"><span class="tele-key">Status</span><span class="tele-val" id="tele-loop-health">--</span></div>
-        </div>
       </div>
     </div>
 
     <div class="panel metrics-panel">
-      <div>
-        <div class="metrics-title">Action + Target</div>
-        <div class="metric-grid">
+      <div class="metrics-stack">
+        <div class="metric-block">
+          <div class="metrics-title">Pose</div>
+          <div class="metric-grid">
+            <div class="metric-card" id="tele-state-box">
+              <div class="summary-label">Actual Pose</div>
+              <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-pos-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-pos-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-pos-z">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot x</span><span class="tele-val" id="tele-rot-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot y</span><span class="tele-val" id="tele-rot-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot z</span><span class="tele-val" id="tele-rot-z">—</span></div>
+              <div class="tele-row"><span class="tele-key">finger1</span><span class="tele-val" id="tele-grip1">—</span></div>
+              <div class="tele-row"><span class="tele-key">finger2</span><span class="tele-val" id="tele-grip2">—</span></div>
+            </div>
+            <div class="metric-card" id="tele-target-box">
+              <div class="summary-label">Commanded Pose</div>
+              <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-tpos-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-tpos-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-tpos-z">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot x</span><span class="tele-val" id="tele-trot-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot y</span><span class="tele-val" id="tele-trot-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot z</span><span class="tele-val" id="tele-trot-z">—</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="metric-block">
+          <div class="metrics-title">Action</div>
+          <div class="metric-grid">
           <div class="metric-card">
             <div class="summary-label">Raw Action</div>
-            <div class="tele-row"><span class="tele-key">dpos</span><span class="tele-val" id="tele-action-pos-mag">--</span></div>
-            <div class="tele-row"><span class="tele-key">drot</span><span class="tele-val" id="tele-action-rot-mag">--</span></div>
-            <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-agrip">--</span></div>
+            <div class="tele-row"><span class="tele-key">dx</span><span class="tele-val" id="tele-action-x">--</span></div>
+            <div class="tele-row"><span class="tele-key">dy</span><span class="tele-val" id="tele-action-y">--</span></div>
+            <div class="tele-row"><span class="tele-key">dz</span><span class="tele-val" id="tele-action-z">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot x</span><span class="tele-val" id="tele-action-rx">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot y</span><span class="tele-val" id="tele-action-ry">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot z</span><span class="tele-val" id="tele-action-rz">--</span></div>
+            <div class="tele-row"><span class="tele-key">gripper cmd</span><span class="tele-val" id="tele-agrip">--</span></div>
           </div>
           <div class="metric-card">
             <div class="summary-label">Transformed Action</div>
-            <div class="tele-row"><span class="tele-key">dpos</span><span class="tele-val" id="tele-action-pos-mag-t">--</span></div>
-            <div class="tele-row"><span class="tele-key">drot</span><span class="tele-val" id="tele-action-rot-mag-t">--</span></div>
-            <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-tagrip">--</span></div>
+            <div class="tele-row"><span class="tele-key">dx</span><span class="tele-val" id="tele-action-t-x">--</span></div>
+            <div class="tele-row"><span class="tele-key">dy</span><span class="tele-val" id="tele-action-t-y">--</span></div>
+            <div class="tele-row"><span class="tele-key">dz</span><span class="tele-val" id="tele-action-t-z">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot x</span><span class="tele-val" id="tele-action-t-rx">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot y</span><span class="tele-val" id="tele-action-t-ry">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot z</span><span class="tele-val" id="tele-action-t-rz">--</span></div>
+            <div class="tele-row"><span class="tele-key">gripper cmd</span><span class="tele-val" id="tele-tagrip">--</span></div>
           </div>
+          </div>
+        </div>
+
+        <div class="metric-block">
+          <div class="metrics-title">System</div>
+          <div class="metric-grid">
           <div class="metric-card" id="loop-card">
             <div class="summary-label">Execution Window</div>
             <div class="metric-value" id="loop-total-ms">--</div>
-            <div class="metric-sub">目标 100.0 ms</div>
+            <div class="metric-sub">目标 200.0 ms</div>
           </div>
           <div class="metric-card">
-            <div class="summary-label">Target Pose</div>
-            <div class="tele-row"><span class="tele-key">pos norm</span><span class="tele-val" id="tele-target-pos-mag">--</span></div>
-            <div class="tele-row"><span class="tele-key">rot norm</span><span class="tele-val" id="tele-target-rot-mag">--</span></div>
-            <div class="tele-row"><span class="tele-key">connected</span><span class="tele-val" id="tele-target-status">--</span></div>
+            <div class="summary-label">Loop Timing</div>
+            <div class="tele-row"><span class="tele-key">infer</span><span class="tele-val" id="tele-infer-ms">--</span></div>
+            <div class="tele-row"><span class="tele-key">total</span><span class="tele-val" id="tele-total-ms">--</span></div>
+            <div class="tele-row"><span class="tele-key">status</span><span class="tele-val" id="tele-loop-health">--</span></div>
           </div>
         </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="telemetry-section">
-    <div class="section-title">Robot Diagnostics</div>
-    <div class="telemetry">
-      <div class="tele-box" id="tele-state-box" style="display:none">
-        <label>EEF State</label>
-    <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-pos-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-pos-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-pos-z">—</span></div>
-    <div class="tele-row"><span class="tele-key">rot ax</span><span class="tele-val" id="tele-rot-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">rot ay</span><span class="tele-val" id="tele-rot-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">rot az</span><span class="tele-val" id="tele-rot-z">—</span></div>
-    <div class="tele-row"><span class="tele-key">finger1</span><span class="tele-val" id="tele-grip1">—</span></div>
-    <div class="tele-row"><span class="tele-key">finger2</span><span class="tele-val" id="tele-grip2">—</span></div>
-  </div>
-      </div>
-      <div class="tele-box" id="tele-joint-box" style="display:none">
-        <label>Joint State</label>
-    <div class="tele-row"><span class="tele-key">q1</span><span class="tele-val" id="tele-q1">—</span></div>
-    <div class="tele-row"><span class="tele-key">q2</span><span class="tele-val" id="tele-q2">—</span></div>
-    <div class="tele-row"><span class="tele-key">q3</span><span class="tele-val" id="tele-q3">—</span></div>
-    <div class="tele-row"><span class="tele-key">q4</span><span class="tele-val" id="tele-q4">—</span></div>
-    <div class="tele-row"><span class="tele-key">q5</span><span class="tele-val" id="tele-q5">—</span></div>
-    <div class="tele-row"><span class="tele-key">q6</span><span class="tele-val" id="tele-q6">—</span></div>
-    <div class="tele-row"><span class="tele-key">q7</span><span class="tele-val" id="tele-q7">—</span></div>
-      </div>
-      <div class="tele-box" id="tele-ft-box" style="display:none">
-        <label>EE Force / Torque</label>
-        <div class="tele-row"><span class="tele-key">Fx</span><span class="tele-val" id="tele-fx">—</span></div>
-        <div class="tele-row"><span class="tele-key">Fy</span><span class="tele-val" id="tele-fy">—</span></div>
-        <div class="tele-row"><span class="tele-key">Fz</span><span class="tele-val" id="tele-fz">—</span></div>
-        <div class="tele-row"><span class="tele-key">Tx</span><span class="tele-val" id="tele-tx">—</span></div>
-        <div class="tele-row"><span class="tele-key">Ty</span><span class="tele-val" id="tele-ty">—</span></div>
-        <div class="tele-row"><span class="tele-key">Tz</span><span class="tele-val" id="tele-tz">—</span></div>
-      </div>
-    </div>
-
-    <div class="section-title">Command Details</div>
-    <div class="telemetry">
-      <div class="tele-box" id="tele-target-box" style="display:none">
-        <label>Commanded Target Pose</label>
-    <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-tpos-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-tpos-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-tpos-z">—</span></div>
-    <div class="tele-row"><span class="tele-key">rot ax</span><span class="tele-val" id="tele-trot-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">rot ay</span><span class="tele-val" id="tele-trot-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">rot az</span><span class="tele-val" id="tele-trot-z">—</span></div>
-      </div>
-      <div class="tele-box" id="tele-action-box" style="display:none">
-        <label>Raw Action</label>
-    <div class="tele-row"><span class="tele-key">Δpos x</span><span class="tele-val" id="tele-apos-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δpos y</span><span class="tele-val" id="tele-apos-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δpos z</span><span class="tele-val" id="tele-apos-z">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δrot ax</span><span class="tele-val" id="tele-arot-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δrot ay</span><span class="tele-val" id="tele-arot-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δrot az</span><span class="tele-val" id="tele-arot-z">—</span></div>
-        <div class="tele-row"><span class="tele-key">gripper</span><span class="tele-val" id="tele-agrip-detail">—</span></div>
-      </div>
-      <div class="tele-box" id="tele-action-t-box" style="display:none">
-        <label>Transformed Action</label>
-    <div class="tele-row"><span class="tele-key">Δpos x</span><span class="tele-val" id="tele-tapos-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δpos y</span><span class="tele-val" id="tele-tapos-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δpos z</span><span class="tele-val" id="tele-tapos-z">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δrot ax</span><span class="tele-val" id="tele-tarot-x">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δrot ay</span><span class="tele-val" id="tele-tarot-y">—</span></div>
-    <div class="tele-row"><span class="tele-key">Δrot az</span><span class="tele-val" id="tele-tarot-z">—</span></div>
-        <div class="tele-row"><span class="tele-key">gripper target</span><span class="tele-val" id="tele-tagrip-detail">—</span></div>
       </div>
     </div>
   </div>
@@ -462,6 +432,8 @@ const promptCurrent = document.getElementById('prompt-current');
 const overlayState = document.getElementById('overlay-state');
 const overlayPrompt = document.getElementById('overlay-prompt');
 const loopCard = document.getElementById('loop-card');
+const LOOP_TARGET_MS = 200.0;
+const LOOP_DANGER_MS = 260.0;
 
 // --- WebSocket 图像流 ---
 const ws = new WebSocket(`ws://${location.host}/ws/frames`);
@@ -553,11 +525,6 @@ function setValue(el, val, opts = {}) {
   el.classList.toggle('danger', !!opts.danger);
 }
 
-function norm3(arr) {
-  if (!arr || arr.length < 3) return null;
-  return Math.sqrt(arr[0] ** 2 + arr[1] ** 2 + arr[2] ** 2);
-}
-
 // --- 元素缓存 ---
 const teleEls = {
   posX: document.getElementById('tele-pos-x'),
@@ -568,29 +535,8 @@ const teleEls = {
   rotZ: document.getElementById('tele-rot-z'),
   grip1: document.getElementById('tele-grip1'),
   grip2: document.getElementById('tele-grip2'),
-  q1: document.getElementById('tele-q1'),
-  q2: document.getElementById('tele-q2'),
-  q3: document.getElementById('tele-q3'),
-  q4: document.getElementById('tele-q4'),
-  q5: document.getElementById('tele-q5'),
-  q6: document.getElementById('tele-q6'),
-  q7: document.getElementById('tele-q7'),
-  aposX: document.getElementById('tele-apos-x'),
-  aposY: document.getElementById('tele-apos-y'),
-  aposZ: document.getElementById('tele-apos-z'),
-  arotX: document.getElementById('tele-arot-x'),
-  arotY: document.getElementById('tele-arot-y'),
-  arotZ: document.getElementById('tele-arot-z'),
   agrip: document.getElementById('tele-agrip'),
-  agripDetail: document.getElementById('tele-agrip-detail'),
-  taposX: document.getElementById('tele-tapos-x'),
-  taposY: document.getElementById('tele-tapos-y'),
-  taposZ: document.getElementById('tele-tapos-z'),
-  tarotX: document.getElementById('tele-tarot-x'),
-  tarotY: document.getElementById('tele-tarot-y'),
-  tarotZ: document.getElementById('tele-tarot-z'),
   tagrip: document.getElementById('tele-tagrip'),
-  tagripDetail: document.getElementById('tele-tagrip-detail'),
   tposX: document.getElementById('tele-tpos-x'),
   tposY: document.getElementById('tele-tpos-y'),
   tposZ: document.getElementById('tele-tpos-z'),
@@ -600,46 +546,31 @@ const teleEls = {
   inferMs: document.getElementById('tele-infer-ms'),
   totalMs: document.getElementById('tele-total-ms'),
   loopHealth: document.getElementById('tele-loop-health'),
-  actionPosMag: document.getElementById('tele-action-pos-mag'),
-  actionRotMag: document.getElementById('tele-action-rot-mag'),
-  actionPosMagT: document.getElementById('tele-action-pos-mag-t'),
-  actionRotMagT: document.getElementById('tele-action-rot-mag-t'),
-  targetPosMag: document.getElementById('tele-target-pos-mag'),
-  targetRotMag: document.getElementById('tele-target-rot-mag'),
-  targetStatus: document.getElementById('tele-target-status'),
+  actionX: document.getElementById('tele-action-x'),
+  actionY: document.getElementById('tele-action-y'),
+  actionZ: document.getElementById('tele-action-z'),
+  actionRx: document.getElementById('tele-action-rx'),
+  actionRy: document.getElementById('tele-action-ry'),
+  actionRz: document.getElementById('tele-action-rz'),
+  actionTX: document.getElementById('tele-action-t-x'),
+  actionTY: document.getElementById('tele-action-t-y'),
+  actionTZ: document.getElementById('tele-action-t-z'),
+  actionTRx: document.getElementById('tele-action-t-rx'),
+  actionTRy: document.getElementById('tele-action-t-ry'),
+  actionTRz: document.getElementById('tele-action-t-rz'),
   loopTotalMs: document.getElementById('loop-total-ms'),
-  fx: document.getElementById('tele-fx'),
-  fy: document.getElementById('tele-fy'),
-  fz: document.getElementById('tele-fz'),
-  tx: document.getElementById('tele-tx'),
-  ty: document.getElementById('tele-ty'),
-  tz: document.getElementById('tele-tz'),
   stateBox: document.getElementById('tele-state-box'),
-  jointBox: document.getElementById('tele-joint-box'),
-  targetBox: document.getElementById('tele-target-box'),
-  ftBox: document.getElementById('tele-ft-box'),
-  actionBox: document.getElementById('tele-action-box'),
-  actionTBox: document.getElementById('tele-action-t-box')
+  targetBox: document.getElementById('tele-target-box')
 };
 
 function updateTelemetry(data) {
   const fmt = (v) => v.toFixed(4);
   const fmtMs = (v) => v.toFixed(1) + ' ms';
-  const rawPosNorm = norm3(data.action_raw ? data.action_raw.slice(0, 3) : null);
-  const rawRotNorm = norm3(data.action_raw ? data.action_raw.slice(3, 6) : null);
-  const tfPosNorm = norm3(data.action_transformed ? data.action_transformed.slice(0, 3) : null);
-  const tfRotNorm = norm3(data.action_transformed ? data.action_transformed.slice(3, 6) : null);
-  const tgtPosNorm = norm3(data.target_pose ? data.target_pose.slice(0, 3) : null);
-  const tgtRotNorm = norm3(data.target_pose ? data.target_pose.slice(3, 6) : null);
   const totalMs = data.total_ms;
-  const overBudget = totalMs != null && totalMs > 100.0;
+  const overBudget = totalMs != null && totalMs > LOOP_TARGET_MS;
 
   teleEls.stateBox.style.display = data.robot_connected ? '' : 'none';
-  teleEls.jointBox.style.display = data.robot_connected ? '' : 'none';
-  teleEls.ftBox.style.display = data.robot_connected && data.ee_force_torque ? '' : 'none';
-  if (teleEls.targetBox) teleEls.targetBox.style.display = (data.robot_connected && data.controller_state === 'running') ? '' : 'none';
-  teleEls.actionBox.style.display = data.server_connected ? '' : 'none';
-  teleEls.actionTBox.style.display = data.server_connected ? '' : 'none';
+  teleEls.targetBox.style.display = data.robot_connected ? '' : 'none';
 
   if (data.robot_connected && data.state) {
     const s = data.state;
@@ -652,25 +583,6 @@ function updateTelemetry(data) {
     setValue(teleEls.grip1, fmt(s[6]));
     setValue(teleEls.grip2, fmt(s[7]));
   }
-  if (data.robot_connected && data.joint_state) {
-    const q = data.joint_state;
-    setValue(teleEls.q1, fmt(q[0]));
-    setValue(teleEls.q2, fmt(q[1]));
-    setValue(teleEls.q3, fmt(q[2]));
-    setValue(teleEls.q4, fmt(q[3]));
-    setValue(teleEls.q5, fmt(q[4]));
-    setValue(teleEls.q6, fmt(q[5]));
-    setValue(teleEls.q7, fmt(q[6]));
-  }
-  if (data.robot_connected && data.ee_force_torque) {
-    const ft = data.ee_force_torque;
-    setValue(teleEls.fx, fmt(ft[0]));
-    setValue(teleEls.fy, fmt(ft[1]));
-    setValue(teleEls.fz, fmt(ft[2]));
-    setValue(teleEls.tx, fmt(ft[3]));
-    setValue(teleEls.ty, fmt(ft[4]));
-    setValue(teleEls.tz, fmt(ft[5]));
-  }
   if (data.robot_connected && data.target_pose) {
     const tp = data.target_pose;
     setValue(teleEls.tposX, fmt(tp[0]));
@@ -682,44 +594,32 @@ function updateTelemetry(data) {
   }
   if (data.server_connected && data.action_raw) {
     const a = data.action_raw;
-    setValue(teleEls.aposX, fmt(a[0]), { warn: Math.abs(a[0]) > 0.01 });
-    setValue(teleEls.aposY, fmt(a[1]), { warn: Math.abs(a[1]) > 0.01 });
-    setValue(teleEls.aposZ, fmt(a[2]), { warn: Math.abs(a[2]) > 0.01 });
-    setValue(teleEls.arotX, fmt(a[3]), { warn: Math.abs(a[3]) > 0.05 });
-    setValue(teleEls.arotY, fmt(a[4]), { warn: Math.abs(a[4]) > 0.05 });
-    setValue(teleEls.arotZ, fmt(a[5]), { warn: Math.abs(a[5]) > 0.05 });
-    const gripLabel = a[6] >= 0 ? 'CLOSE' : 'OPEN';
-    setValue(teleEls.agrip, gripLabel);
-    setValue(teleEls.agripDetail, gripLabel);
+    setValue(teleEls.actionX, fmt(a[0]), { warn: Math.abs(a[0]) > 0.01 });
+    setValue(teleEls.actionY, fmt(a[1]), { warn: Math.abs(a[1]) > 0.01 });
+    setValue(teleEls.actionZ, fmt(a[2]), { warn: Math.abs(a[2]) > 0.01 });
+    setValue(teleEls.actionRx, fmt(a[3]), { warn: Math.abs(a[3]) > 0.05 });
+    setValue(teleEls.actionRy, fmt(a[4]), { warn: Math.abs(a[4]) > 0.05 });
+    setValue(teleEls.actionRz, fmt(a[5]), { warn: Math.abs(a[5]) > 0.05 });
+    setValue(teleEls.agrip, fmt(a[6]));
   }
   if (data.server_connected && data.action_transformed) {
     const ta = data.action_transformed;
-    setValue(teleEls.taposX, fmt(ta[0]));
-    setValue(teleEls.taposY, fmt(ta[1]));
-    setValue(teleEls.taposZ, fmt(ta[2]));
-    setValue(teleEls.tarotX, fmt(ta[3]));
-    setValue(teleEls.tarotY, fmt(ta[4]));
-    setValue(teleEls.tarotZ, fmt(ta[5]));
-    const gripTarget = ta[6] > 0.04 ? 'OPEN' : 'CLOSE';
-    setValue(teleEls.tagrip, gripTarget);
-    setValue(teleEls.tagripDetail, gripTarget);
+    setValue(teleEls.actionTX, fmt(ta[0]));
+    setValue(teleEls.actionTY, fmt(ta[1]));
+    setValue(teleEls.actionTZ, fmt(ta[2]));
+    setValue(teleEls.actionTRx, fmt(ta[3]));
+    setValue(teleEls.actionTRy, fmt(ta[4]));
+    setValue(teleEls.actionTRz, fmt(ta[5]));
+    setValue(teleEls.tagrip, fmt(ta[6]));
   }
   if (data.infer_ms != null) {
     setValue(teleEls.inferMs, fmtMs(data.infer_ms), { warn: data.infer_ms > 70.0 });
   }
   if (data.total_ms != null) {
-    setValue(teleEls.totalMs, fmtMs(data.total_ms), { warn: data.total_ms > 100.0, danger: data.total_ms > 130.0 });
-    setValue(teleEls.loopTotalMs, fmtMs(data.total_ms), { warn: overBudget, danger: data.total_ms > 130.0 });
-    setValue(teleEls.loopHealth, overBudget ? 'over budget' : 'stable', { warn: overBudget, danger: data.total_ms > 130.0 });
+    setValue(teleEls.totalMs, fmtMs(data.total_ms), { warn: data.total_ms > LOOP_TARGET_MS, danger: data.total_ms > LOOP_DANGER_MS });
+    setValue(teleEls.loopTotalMs, fmtMs(data.total_ms), { warn: overBudget, danger: data.total_ms > LOOP_DANGER_MS });
+    setValue(teleEls.loopHealth, overBudget ? 'over budget' : 'stable', { warn: overBudget, danger: data.total_ms > LOOP_DANGER_MS });
   }
-
-  setValue(teleEls.actionPosMag, rawPosNorm != null ? fmt(rawPosNorm) : '--');
-  setValue(teleEls.actionRotMag, rawRotNorm != null ? fmt(rawRotNorm) : '--');
-  setValue(teleEls.actionPosMagT, tfPosNorm != null ? fmt(tfPosNorm) : '--');
-  setValue(teleEls.actionRotMagT, tfRotNorm != null ? fmt(tfRotNorm) : '--');
-  setValue(teleEls.targetPosMag, tgtPosNorm != null ? fmt(tgtPosNorm) : '--');
-  setValue(teleEls.targetRotMag, tgtRotNorm != null ? fmt(tgtRotNorm) : '--');
-  setValue(teleEls.targetStatus, data.robot_connected ? 'tracking' : 'offline');
   loopCard.classList.toggle('warn', overBudget);
 }
 

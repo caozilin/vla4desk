@@ -109,6 +109,23 @@ class Coordinator:
             logger.warning(f"推理服务连接失败，推理功能不可用：{e}")
             self._client = None
 
+    def _clear_action_runtime(self):
+        with self._telemetry_lock:
+            self._latest_action = None
+            self._latest_action_transformed = None
+            self._latest_infer_ms = None
+            self._latest_prev_total_ms = None
+
+    def _reset_policy_client(self, reason: str):
+        client = self._client
+        if client is None:
+            return
+        try:
+            logger.info("Resetting inference client: %s", reason)
+            client.reset()
+        except Exception as e:
+            logger.warning("推理客户端 reset 失败（%s）：%s", reason, e)
+
     # ------------------------------------------------------------------
     # 状态机控制（供 REST API 调用）
     # ------------------------------------------------------------------
@@ -126,12 +143,16 @@ class Coordinator:
                 self._action_plan.clear()
                 self._state = State.IDLE
                 logger.info("State -> IDLE")
+        self._clear_action_runtime()
+        self._reset_policy_client("stop")
 
     def cmd_home(self):
         with self._state_lock:
             self._action_plan.clear()
             self._state = State.HOMING
             logger.info("State -> HOMING")
+        self._clear_action_runtime()
+        self._reset_policy_client("home")
 
     def cmd_set_prompt(self, prompt: str):
         with self._prompt_lock:
@@ -192,8 +213,8 @@ class Coordinator:
     def run_control_loop(self):
         """10Hz 控制循环。"""
         dt = 1.0 / self._args.control_hz
-        self._env.start_control()
-        logger.info("Control loop started (skill thread running at 10Hz)")
+        self._env.start_control(home_first=True)
+        logger.info("Control loop started after homing (skill thread running at 10Hz)")
 
         last_state = State.IDLE
         next_tick = time.perf_counter()
@@ -255,7 +276,15 @@ class Coordinator:
             return
 
         t0 = time.time()
-        result = self._client.infer(obs)
+        try:
+            result = self._client.infer(obs)
+        except Exception as e:
+            logger.warning("推理请求失败，切回 IDLE：%s", e)
+            self._clear_action_runtime()
+            self._reset_policy_client("infer_error")
+            with self._state_lock:
+                self._state = State.IDLE
+            return
         prev_total_ms = (time.time() - t0) * 1000
         action_chunk = result["actions"]
         timing = result.get("server_timing", {})
@@ -303,6 +332,7 @@ class Coordinator:
 
     def _handle_homing(self):
         self._env.home_and_restart()
+        self._clear_action_runtime()
         with self._state_lock:
             self._state = State.IDLE
         logger.info("Homing complete, State -> IDLE")

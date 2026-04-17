@@ -1,5 +1,6 @@
 import logging
 import time
+import threading
 from typing import Dict, Optional, Tuple
 
 from typing_extensions import override
@@ -34,6 +35,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             self._uri += f":{port}"
         self._packer = msgpack_numpy.Packer()
         self._api_key = api_key
+        self._ws_lock = threading.Lock()
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -65,8 +67,12 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         / 通过向服务器发送观察并接收动作来执行推理。
         """
         data = self._packer.pack(obs)
-        self._ws.send(data)
-        response = self._ws.recv()
+        with self._ws_lock:
+            ws = self._ws
+        if ws is None:
+            raise RuntimeError("推理连接未建立")
+        ws.send(data)
+        response = ws.recv()
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             # 我们期望接收字节；如果服务器发送字符串，则说明出错了。
@@ -76,4 +82,18 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     @override
     def reset(self) -> None:
         """Reset policy state. / 重置策略状态。"""
-        pass
+        logging.info("Resetting inference websocket connection...")
+        with self._ws_lock:
+            old_ws = self._ws
+            self._ws = None
+
+        if old_ws is not None:
+            try:
+                old_ws.close()
+            except Exception:
+                logging.exception("关闭旧的推理 websocket 连接失败")
+
+        ws, metadata = self._wait_for_server()
+        with self._ws_lock:
+            self._ws = ws
+            self._server_metadata = metadata

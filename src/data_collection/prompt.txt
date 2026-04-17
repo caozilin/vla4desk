@@ -1,0 +1,24 @@
+Task: Generate 50 diverse English instructional prompts for a VLA (Vision-Language-Action) model based on a target command.
+
+Learn from the following example to understand the required generalization strategies:
+Example Command: "Put the yellow cube on the red plate."
+Example Strategies:
+
+Synonym Replacement: Vary verbs (put, place, move, drop, grab), objects (cube, block, square, piece, object), and destinations (plate, dish, tray, pan, saucer).
+
+Syntactic Variation: Alter word order (e.g., active voice, preposition-first like "onto the red plate put the cube").
+
+Modifier Omission/Abstraction: Omit colors, nouns, or use color-only descriptors (e.g., "put the yellow on the red", "put the block on the plate").
+
+Strict Formatting Constraints for the output:
+
+Exactly 50 sentences.
+
+Strictly in lowercase.
+
+Absolutely no punctuation (no periods, no commas, no quotation marks).
+
+Output one sentence per line.
+
+Now, apply these exact same generalization strategies to generate 50 prompts for the following new task:
+[在这里输入您的新任务，例如：把蓝色的水杯放到木质的桌子上 / put the blue cup on the wooden table]

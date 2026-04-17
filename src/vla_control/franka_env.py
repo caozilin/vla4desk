@@ -59,13 +59,15 @@ D435_START_RETRIES = 5
 D435_START_RETRY_DELAY = 0.5
 
 POS_CLIP = 1.0          # 位置 action 输入截断范围 [-POS_CLIP, POS_CLIP]
-ROT_CLIP = 0.1          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
-POS_MAX_VEL = 0.1 / 3      # 末端位置最大速度 (m/s)
-ROT_MAX_VEL = (math.pi / 4) / 3   # 末端旋转最大速度 (rad/s)
+ROT_CLIP = 6.0          # 旋转 action 输入截断范围 [-ROT_CLIP, ROT_CLIP]
+POS_MAX_VEL = 0.1       # 末端位置最大速度 (m/s)
+ROT_MAX_VEL = (math.pi / 4)    # 末端旋转最大速度 (rad/s)
 GRIPPER_SPEED = 0.08    # 夹爪运动速度 (m/s)，1s 走完全程 0.08m
 GRIPPER_WIDTH_MAX = 0.08
 POS_SCALE = POS_MAX_VEL * CONTROL_DT / POS_CLIP
 ROT_SCALE = ROT_MAX_VEL * CONTROL_DT / ROT_CLIP
+MAX_TRANSLATION_ERROR = 0.03  # m
+MAX_ROTATION_ERROR = 0.35 # rad
 
 # 阻抗控制刚度参数，与 key_control 保持一致
 TRANSLATIONAL_STIFFNESS = FC.DEFAULT_TRANSLATIONAL_STIFFNESSES if HAS_FRANKA else [600.0, 600.0, 600.0]
@@ -314,7 +316,7 @@ class FrankaEnv:
         self,
         cam1_serial: str | None = DEFAULT_CAM1_SERIAL,
         cam2_serial: str | None = DEFAULT_CAM2_SERIAL,
-        dynamic_duration: float = 60.0,
+        dynamic_duration: float = 3600.0,
         no_robot: bool = False,
         pos_clip: float = POS_CLIP,
         rot_clip: float = ROT_CLIP,
@@ -545,6 +547,139 @@ class FrankaEnv:
             next_pose[3:6] = Rotation.from_matrix(delta_rot @ current_rot).as_rotvec()
         return next_pose
 
+    def _compute_translation_error_scale(
+        self,
+        actual_pos: np.ndarray,
+        commanded_pose: "RigidTransform",
+        transformed_action: np.ndarray,
+    ) -> float:
+        current_error = np.asarray(commanded_pose.translation, dtype=np.float64) - np.asarray(actual_pos, dtype=np.float64)
+        delta_pos = np.asarray(transformed_action[:3], dtype=np.float64)
+        predicted_error = current_error + delta_pos
+
+        predicted_norm = float(np.linalg.norm(predicted_error))
+        if predicted_norm <= MAX_TRANSLATION_ERROR:
+            return 1.0
+
+        delta_norm_sq = float(np.dot(delta_pos, delta_pos))
+        if delta_norm_sq <= 1e-12:
+            return 1.0
+
+        current_norm = float(np.linalg.norm(current_error))
+        if current_norm >= MAX_TRANSLATION_ERROR:
+            # 当前误差已经超限时，只允许继续执行能减小误差的平移分量。
+            if float(np.dot(current_error, delta_pos)) >= 0.0:
+                return 0.0
+
+        a = delta_norm_sq
+        b = 2.0 * float(np.dot(current_error, delta_pos))
+        c = float(np.dot(current_error, current_error)) - MAX_TRANSLATION_ERROR ** 2
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0.0:
+            return 0.0
+
+        sqrt_disc = math.sqrt(max(discriminant, 0.0))
+        roots = [
+            (-b - sqrt_disc) / (2.0 * a),
+            (-b + sqrt_disc) / (2.0 * a),
+        ]
+        valid_roots = [root for root in roots if 0.0 <= root <= 1.0]
+        if not valid_roots:
+            return 0.0
+        return float(max(valid_roots))
+
+    def _compute_rotation_error_norm(
+        self,
+        actual_rotvec: np.ndarray,
+        commanded_pose: "RigidTransform",
+        delta_rotvec: np.ndarray | None = None,
+        scale: float = 1.0,
+    ) -> float:
+        actual_rot = Rotation.from_rotvec(np.asarray(actual_rotvec, dtype=np.float64))
+        commanded_rot = Rotation.from_matrix(commanded_pose.rotation)
+        if delta_rotvec is not None:
+            commanded_rot = Rotation.from_rotvec(np.asarray(delta_rotvec, dtype=np.float64) * scale) * commanded_rot
+        error_rot = commanded_rot * actual_rot.inv()
+        return float(np.linalg.norm(error_rot.as_rotvec()))
+
+    def _compute_rotation_error_scale(
+        self,
+        actual_rotvec: np.ndarray,
+        commanded_pose: "RigidTransform",
+        transformed_action: np.ndarray,
+    ) -> float:
+        delta_rotvec = np.asarray(transformed_action[3:6], dtype=np.float64)
+        if float(np.dot(delta_rotvec, delta_rotvec)) <= 1e-12:
+            return 1.0
+
+        current_norm = self._compute_rotation_error_norm(actual_rotvec, commanded_pose)
+        predicted_norm = self._compute_rotation_error_norm(
+            actual_rotvec,
+            commanded_pose,
+            delta_rotvec,
+            scale=1.0,
+        )
+        if predicted_norm <= MAX_ROTATION_ERROR:
+            return 1.0
+        if current_norm >= MAX_ROTATION_ERROR and predicted_norm >= current_norm:
+            return 0.0
+
+        sample_count = 64
+        scales = np.linspace(0.0, 1.0, sample_count + 1)
+        norms = [
+            self._compute_rotation_error_norm(
+                actual_rotvec,
+                commanded_pose,
+                delta_rotvec,
+                scale=float(scale),
+            )
+            for scale in scales
+        ]
+        feasible_indices = [idx for idx, norm in enumerate(norms) if norm <= MAX_ROTATION_ERROR]
+        if not feasible_indices:
+            return 0.0
+
+        best_idx = max(feasible_indices)
+        best_scale = float(scales[best_idx])
+        if best_idx == sample_count:
+            return 1.0
+
+        low = best_scale
+        high = float(scales[best_idx + 1])
+        for _ in range(20):
+            mid = 0.5 * (low + high)
+            mid_norm = self._compute_rotation_error_norm(
+                actual_rotvec,
+                commanded_pose,
+                delta_rotvec,
+                scale=mid,
+            )
+            if mid_norm <= MAX_ROTATION_ERROR:
+                low = mid
+            else:
+                high = mid
+        return float(low)
+
+    def _limit_action_by_pose_error(
+        self,
+        actual_pos: np.ndarray,
+        actual_rotvec: np.ndarray,
+        commanded_pose: "RigidTransform",
+        transformed_action: np.ndarray,
+        raw_action: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        translation_scale = self._compute_translation_error_scale(actual_pos, commanded_pose, transformed_action)
+        rotation_scale = self._compute_rotation_error_scale(actual_rotvec, commanded_pose, transformed_action)
+        scale = min(translation_scale, rotation_scale)
+        if scale >= 1.0:
+            return transformed_action, raw_action
+
+        limited_transformed_action = np.asarray(transformed_action, dtype=np.float64).copy()
+        limited_raw_action = np.asarray(raw_action, dtype=np.float64).copy()
+        limited_transformed_action[:6] *= scale
+        limited_raw_action[:6] *= scale
+        return limited_transformed_action, limited_raw_action
+
     def get_robot_state_vector(self) -> np.ndarray:
         """返回当前机器人 state 向量，格式与 observation/state 一致。"""
         if self._fa is None:
@@ -614,7 +749,13 @@ class FrankaEnv:
         except queue.Empty:
             return None
 
-    def _resolve_goal_pose(self, commanded_pose: "RigidTransform", action):
+    def _resolve_goal_pose(
+        self,
+        commanded_pose: "RigidTransform",
+        actual_pos: np.ndarray,
+        actual_rotvec: np.ndarray,
+        action,
+    ):
         if action is None:
             return commanded_pose, commanded_pose, None, None
 
@@ -624,6 +765,13 @@ class FrankaEnv:
 
         raw_action = np.asarray(action, dtype=np.float64).copy()
         transformed_action = self.transform_action(raw_action, scale_motion=should_transform)
+        transformed_action, raw_action = self._limit_action_by_pose_error(
+            actual_pos,
+            actual_rotvec,
+            commanded_pose,
+            transformed_action,
+            raw_action,
+        )
         goal_pose = self._compute_target_pose(commanded_pose, transformed_action[:6])
         return commanded_pose, goal_pose, transformed_action, raw_action
 
@@ -819,7 +967,12 @@ class FrankaEnv:
                 if action is None and self._skill_stop.is_set():
                     break
 
-                start_pose, goal_pose, transformed_action, raw_action = self._resolve_goal_pose(commanded_pose, action)
+                start_pose, goal_pose, transformed_action, raw_action = self._resolve_goal_pose(
+                    commanded_pose,
+                    state[:3],
+                    state[3:6],
+                    action,
+                )
                 commanded_pose = goal_pose
                 self._set_commanded_pose_array(commanded_pose)
 
