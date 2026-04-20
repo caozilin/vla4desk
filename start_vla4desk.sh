@@ -32,34 +32,78 @@ DISPLAY_VALUE="${DISPLAY:-:1}"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
-# 确保容器运行
-if ! docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}")" != "true" ]]; then
-  echo "[INFO] starting container ${CONTAINER_NAME}..."
-  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-  docker run -dit \
-    --name "${CONTAINER_NAME}" \
-    --privileged \
-    --network host \
-    --cap-add IPC_LOCK \
-    --cap-add SYS_NICE \
-    --security-opt label=disable \
-    -e DISPLAY="${DISPLAY_VALUE}" \
-    -e QT_X11_NO_MITSHM=1 \
-    -e HOME=/root \
-    -v "${HOST_CODE_ROOT}:/root/Documents/my_code" \
-    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-    -v /dev/input:/dev/input \
-    -v /run/udev:/run/udev:ro \
-    -w /root/Documents/my_code/vla4desk \
-    "${IMAGE_NAME}" \
-    bash >/dev/null
-fi
+cleanup() {
+    echo ""
+    echo "[INFO] 收到终止信号，正在清理..."
 
-# 容器内执行命令
+    echo "[INFO] 终止容器内的 coordinator.py 进程..."
+    docker exec "${CONTAINER_NAME}" bash -c '
+        for pid in $(pgrep -f "coordinator.py"); do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        sleep 1
+        for pid in $(pgrep -f "coordinator.py"); do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+    ' 2>/dev/null || true
+
+    echo "[INFO] 修复文件夹权限..."
+    docker exec "${CONTAINER_NAME}" bash -lc "
+      chown -R ${HOST_UID}:${HOST_GID} ${WORKSPACE_ROOT}/vla4desk/collected 2>/dev/null || true
+      chown -R ${HOST_UID}:${HOST_GID} ${WORKSPACE_ROOT}/vla4desk/logs 2>/dev/null || true
+      chmod -R u+rw ${WORKSPACE_ROOT}/vla4desk/collected 2>/dev/null || true
+      chmod -R u+rw ${WORKSPACE_ROOT}/vla4desk/logs 2>/dev/null || true
+    " 2>/dev/null || true
+
+    echo "[OK] 清理完成"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM EXIT
+
 WORKSPACE_ROOT="/root/Documents/my_code"
+
+ensure_container_running() {
+    if ! docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}")" != "true" ]]; then
+      echo "[INFO] starting container ${CONTAINER_NAME}..."
+      docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+      docker run -dit \
+        --name "${CONTAINER_NAME}" \
+        --privileged \
+        --network host \
+        --cap-add IPC_LOCK \
+        --cap-add SYS_NICE \
+        --security-opt label:disable \
+        -e DISPLAY="${DISPLAY_VALUE}" \
+        -e QT_X11_NO_MITSHM=1 \
+        -e HOME=/root \
+        -v "${HOST_CODE_ROOT}:/root/Documents/my_code" \
+        -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+        -v /dev/input:/dev/input \
+        -v /run/udev:/run/udev:ro \
+        -w /root/Documents/my_code/vla4desk \
+        "${IMAGE_NAME}" \
+        bash >/dev/null
+    fi
+}
+
+fix_permissions() {
+    echo "[INFO] 修复文件夹权限..."
+    docker exec "${CONTAINER_NAME}" bash -lc "
+      chown -R ${HOST_UID}:${HOST_GID} ${WORKSPACE_ROOT}/vla4desk/collected 2>/dev/null || true
+      chown -R ${HOST_UID}:${HOST_GID} ${WORKSPACE_ROOT}/vla4desk/logs 2>/dev/null || true
+      chmod -R u+rw ${WORKSPACE_ROOT}/vla4desk/collected 2>/dev/null || true
+      chmod -R u+rw ${WORKSPACE_ROOT}/vla4desk/logs 2>/dev/null || true
+    " 2>/dev/null || true
+    echo "[OK] 权限修复完成"
+}
+
+ensure_container_running
+
 FRANKA_INTERFACE_LD_PATH="${WORKSPACE_ROOT}/franka-interface/build/franka-interface:${WORKSPACE_ROOT}/franka-interface/build/franka-interface/proto:${WORKSPACE_ROOT}/franka-interface/build/libfranka:${WORKSPACE_ROOT}/franka-interface/build/franka-interface-common:/usr/local/lib"
 FRANKAPY_PYTHONPATH="${WORKSPACE_ROOT}/frankapy"
 
+echo "[INFO] 启动 coordinator.py..."
 docker exec -it \
   -e WORKSPACE_ROOT="${WORKSPACE_ROOT}" \
   -e FRANKAPY_PYTHONPATH="${FRANKAPY_PYTHONPATH}" \
@@ -71,15 +115,7 @@ docker exec -it \
     source /opt/ros/humble/setup.bash
     source ${WORKSPACE_ROOT}/franka-interface/install/setup.bash
     cd ${WORKSPACE_ROOT}/vla4desk/src/vla_control
-    python coordinator.py $*
+    exec python coordinator.py $*
   "
 
-# 修复 collected 和 logs 文件夹权限
-echo "[INFO] 修复文件夹权限..."
-docker exec "${CONTAINER_NAME}" bash -lc "
-  chown -R ${HOST_UID}:${HOST_GID} ${WORKSPACE_ROOT}/vla4desk/collected 2>/dev/null || true
-  chown -R ${HOST_UID}:${HOST_GID} ${WORKSPACE_ROOT}/vla4desk/logs 2>/dev/null || true
-  chmod -R u+rw ${WORKSPACE_ROOT}/vla4desk/collected 2>/dev/null || true
-  chmod -R u+rw ${WORKSPACE_ROOT}/vla4desk/logs 2>/dev/null || true
-" 2>/dev/null || true
-echo "[OK] 权限修复完成"
+fix_permissions
