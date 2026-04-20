@@ -55,17 +55,41 @@ docker exec "${CONTAINER_NAME}" bash -lc "
 set +e
 LOG_DIR='${LOG_DIR}'
 
-# 清理 FastDDS 残留 SHM 文件，避免 /dev/shm 被 fastrtps_* 撑满
-rm -f /dev/shm/fastrtps_* /dev/shm/fastrtps_*_el >/dev/null 2>&1 || true
+# 清理 FastDDS 残留 SHM/semaphore 文件，避免旧 DDS 会话影响新节点发现
+rm -f /dev/shm/fastrtps_* /dev/shm/fastrtps_*_el /dev/shm/sem.fastrtps_* >/dev/null 2>&1 || true
 
-# 仅按命令行清理，且使用 [f] 写法避免命中当前清理命令自身
-pkill -f '[f]ranka_interface --robot_ip' >/dev/null 2>&1 || true
-pkill -f '[f]ranka_ros_interface.launch.py' >/dev/null 2>&1 || true
-pkill -f '[f]ranka_ros_interface_execute_skill_action_server' >/dev/null 2>&1 || true
-pkill -f '[f]ranka_gripper.launch.py' >/dev/null 2>&1 || true
-pkill -f '[f]ranka_gripper_node_' >/dev/null 2>&1 || true
+# 仅按命令行清理，且使用 [x] 写法避免命中当前清理命令自身。
+# ROS launch 崩溃后，子节点可能变成 PPID=1 的孤儿进程，所以父/子进程都要清。
+patterns=(
+  '[r]un_dynamic_pose.py'
+  '[f]ranka_interface --robot_ip'
+  '[r]os2 launch franka_ros_interface'
+  '[f]ranka_ros_interface.launch.py'
+  '[f]ranka_gripper.launch.py'
+  '[f]ranka_ros_interface/'
+  '[f]ranka_gripper/'
+  '[e]xecute_skill_action_server_node_1'
+  '[r]obot_state_publisher_node_1'
+  '[f]ranka_interface_status_publisher_node_1'
+  '[r]un_loop_process_info_state_publisher_node_1'
+  '[g]et_current_robot_state_server_node_1'
+  '[g]et_current_franka_interface_status_server_node_1'
+  '[s]ensor_data_subscriber_node_1'
+  '[f]ranka_gripper_1'
+  '[g]et_current_gripper_state_server_node_1'
+)
+
+for pattern in \"\${patterns[@]}\"; do
+  pkill -TERM -f \"\${pattern}\" >/dev/null 2>&1 || true
+done
 
 sleep 1
+
+for pattern in \"\${patterns[@]}\"; do
+  pkill -KILL -f \"\${pattern}\" >/dev/null 2>&1 || true
+done
+
+rm -f /dev/shm/fastrtps_* /dev/shm/fastrtps_*_el /dev/shm/sem.fastrtps_* >/dev/null 2>&1 || true
 "
 echo "[OK] 旧进程清理完成"
 

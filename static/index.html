@@ -212,6 +212,7 @@
     display: grid;
     gap: 10px;
   }
+  .cam-stack .metric-grid { grid-template-columns: 1fr; }
   .telemetry-section {
     display: grid;
     gap: 12px;
@@ -330,6 +331,22 @@
           <label>Wrist Camera</label>
           <img id="img2" alt="cam2">
         </div>
+        <div class="metric-block">
+          <div class="metrics-title">System</div>
+          <div class="metric-grid">
+            <div class="metric-card" id="loop-card">
+              <div class="summary-label">Execution Window</div>
+              <div class="metric-value" id="loop-total-ms">--</div>
+              <div class="metric-sub">目标 300.0 ms</div>
+            </div>
+            <div class="metric-card">
+              <div class="summary-label">Loop Timing</div>
+              <div class="tele-row"><span class="tele-key">infer</span><span class="tele-val" id="tele-infer-ms">--</span></div>
+              <div class="tele-row"><span class="tele-key">total</span><span class="tele-val" id="tele-total-ms">--</span></div>
+              <div class="tele-row"><span class="tele-key">status</span><span class="tele-val" id="tele-loop-health">--</span></div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -387,21 +404,6 @@
           </div>
         </div>
 
-        <div class="metric-block">
-          <div class="metrics-title">System</div>
-          <div class="metric-grid">
-          <div class="metric-card" id="loop-card">
-            <div class="summary-label">Execution Window</div>
-            <div class="metric-value" id="loop-total-ms">--</div>
-            <div class="metric-sub">目标 300.0 ms</div>
-          </div>
-          <div class="metric-card">
-            <div class="summary-label">Loop Timing</div>
-            <div class="tele-row"><span class="tele-key">infer</span><span class="tele-val" id="tele-infer-ms">--</span></div>
-            <div class="tele-row"><span class="tele-key">total</span><span class="tele-val" id="tele-total-ms">--</span></div>
-            <div class="tele-row"><span class="tele-key">status</span><span class="tele-val" id="tele-loop-health">--</span></div>
-          </div>
-        </div>
       </div>
     </div>
   </div>
