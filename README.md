@@ -54,6 +54,11 @@ docker exec -it franka_vla4desk bash
 
 # 完整模式（机械臂 + 推理服务）
 /home/k324/franka_my_code/vla4desk/start_vla4desk.sh
+
+# 指定初始语言指令和推理日志子目录；日志保存到 logs/eval/robu/epo_1 起
+/home/k324/franka_my_code/vla4desk/start_vla4desk.sh \
+  --prompt "pick up the bottle" \
+  --log_subdir eval/robu
 ```
 
 浏览器打开 `http://localhost:8080`
@@ -76,7 +81,9 @@ python src/vla_control/coordinator.py \
   --port 8000 \
   --cam1_serial <D435序列号> \
   --cam2_serial <D435序列号> \
-  --web_port 8080
+  --web_port 8080 \
+  --prompt "pick up the bottle" \
+  --log_subdir eval/robu
 ```
 
 ### 云端推理服务（在 openpi 目录）

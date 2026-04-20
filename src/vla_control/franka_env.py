@@ -1058,6 +1058,9 @@ class FrankaEnv:
                     break
         self._action_queue.put((action_arr, transform))
 
+    def get_pending_action_count(self) -> int:
+        return self._action_queue.qsize()
+
     def hold_pose(self):
         """外部调用：放一个 None 进队列，让 _skill_loop 保持当前位姿一拍。"""
         # 队列非空时不重复放，避免积压

@@ -43,7 +43,7 @@
   }
   .summary {
     display: grid;
-    grid-template-columns: repeat(4, minmax(120px, 1fr));
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
     gap: 10px;
   }
   .summary-card {
@@ -98,7 +98,7 @@
     line-height: 1.45;
   }
   .prompt-row { display: flex; gap: 8px; }
-  #prompt-input {
+  .text-input {
     flex: 1;
     padding: 10px 12px;
     background: #111617;
@@ -123,19 +123,8 @@
   #btn-stop   { background: #632d2d; color: #fff; border-color: #8e4343; }
   #btn-home   { background: #22385d; color: #fff; border-color: #365b93; }
   #btn-send-prompt { background: #313c40; color: #eaf4f2; border-color: #47585f; }
+  #btn-send-log { background: #313c40; color: #eaf4f2; border-color: #47585f; }
   button:disabled { opacity: 0.4; cursor: default; }
-  .conn-row { display: flex; gap: 10px; flex-wrap: wrap; }
-  .conn-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 7px 10px;
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    color: var(--muted);
-    font-size: 0.8rem;
-  }
   .conn-dot {
     display: inline-block;
     width: 8px;
@@ -263,7 +252,6 @@
   .muted { color: var(--muted); }
   @media (max-width: 1200px) {
     .topbar, .main-grid, .camera-panel, .telemetry { grid-template-columns: 1fr; }
-    .summary { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
   }
   @media (max-width: 720px) {
     body { padding: 12px; }
@@ -309,17 +297,20 @@
         <div class="prompt-current" id="prompt-current">--</div>
       </div>
       <div class="prompt-row">
-        <input id="prompt-input" type="text" placeholder="输入语言指令..." value="pick up the bottle and put it into the box">
+        <input id="prompt-input" class="text-input" type="text" placeholder="输入语言指令..." value="">
         <button id="btn-send-prompt" onclick="sendPrompt()">发送指令</button>
+      </div>
+      <div>
+        <div class="prompt-label">Log Subfolder</div>
+      </div>
+      <div class="prompt-row">
+        <input id="log-subdir-input" class="text-input" type="text" placeholder="eval/robu" value="">
+        <button id="btn-send-log" onclick="sendLogSubdir()">更新路径</button>
       </div>
       <div class="controls">
         <button id="btn-start" onclick="cmd('start')">推理</button>
         <button id="btn-stop" onclick="cmd('stop')">停止</button>
         <button id="btn-home" onclick="cmd('home')">复位</button>
-      </div>
-      <div class="conn-row">
-        <div class="conn-chip">Robot <span class="conn-dot" id="dot-robot-chip"></span></div>
-        <div class="conn-chip">Server <span class="conn-dot" id="dot-server-chip"></span></div>
       </div>
     </div>
   </div>
@@ -402,7 +393,7 @@
           <div class="metric-card" id="loop-card">
             <div class="summary-label">Execution Window</div>
             <div class="metric-value" id="loop-total-ms">--</div>
-            <div class="metric-sub">目标 200.0 ms</div>
+            <div class="metric-sub">目标 300.0 ms</div>
           </div>
           <div class="metric-card">
             <div class="summary-label">Loop Timing</div>
@@ -423,17 +414,28 @@ const stateBadge = document.getElementById('state-badge');
 const recIndicator = document.getElementById('rec-indicator');
 const dotRobot = document.getElementById('dot-robot');
 const dotServer = document.getElementById('dot-server');
-const dotRobotChip = document.getElementById('dot-robot-chip');
-const dotServerChip = document.getElementById('dot-server-chip');
 const robotStatus = document.getElementById('robot-status');
 const serverStatus = document.getElementById('server-status');
 const recordingText = document.getElementById('recording-text');
 const promptCurrent = document.getElementById('prompt-current');
+const promptInput = document.getElementById('prompt-input');
+const logSubdirInput = document.getElementById('log-subdir-input');
 const overlayState = document.getElementById('overlay-state');
 const overlayPrompt = document.getElementById('overlay-prompt');
 const loopCard = document.getElementById('loop-card');
-const LOOP_TARGET_MS = 200.0;
+const LOOP_TARGET_MS = 300.0;
 const LOOP_DANGER_MS = 260.0;
+let promptDirty = false;
+let logSubdirDirty = false;
+
+promptInput.addEventListener('input', () => { promptDirty = true; });
+logSubdirInput.addEventListener('input', () => { logSubdirDirty = true; });
+promptInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendPrompt();
+});
+logSubdirInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendLogSubdir();
+});
 
 // --- WebSocket 图像流 ---
 const ws = new WebSocket(`ws://${location.host}/ws/frames`);
@@ -459,19 +461,48 @@ ws.onclose = () => console.warn('WS closed');
 
 // --- 控制指令 ---
 async function cmd(action) {
+  if (action === 'start') {
+    await sendPrompt();
+    const ok = await sendLogSubdir();
+    if (!ok) return;
+  }
   await fetch(`/cmd/${action}`, { method: 'POST' });
   pollStatus();
 }
 
 async function sendPrompt() {
-  const prompt = document.getElementById('prompt-input').value;
+  const prompt = promptInput.value;
   await fetch('/cmd/prompt', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt }),
   });
+  promptDirty = false;
   promptCurrent.textContent = prompt || '--';
   overlayPrompt.textContent = summarizePrompt(prompt);
+  return true;
+}
+
+async function sendLogSubdir() {
+  const log_subdir = logSubdirInput.value.trim();
+  const res = await fetch('/cmd/log_subdir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ log_subdir }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail || detail;
+    } catch (_) {}
+    alert(`Log path invalid: ${detail}`);
+    return false;
+  }
+  const data = await res.json();
+  logSubdirDirty = false;
+  logSubdirInput.value = data.log_subdir || '';
+  return true;
 }
 
 // --- 状态轮询 ---
@@ -500,11 +531,18 @@ function updateHeader(data) {
   const prompt = data.prompt ?? '';
   promptCurrent.textContent = prompt || '--';
   overlayPrompt.textContent = summarizePrompt(prompt);
+  if (!promptDirty && document.activeElement !== promptInput) {
+    promptInput.value = prompt;
+  }
+
+  if (data.log_subdir != null) {
+    if (!logSubdirDirty && document.activeElement !== logSubdirInput) {
+      logSubdirInput.value = data.log_subdir || '';
+    }
+  }
 
   updateConnection(dotRobot, data.robot_connected);
   updateConnection(dotServer, data.server_connected);
-  updateConnection(dotRobotChip, data.robot_connected);
-  updateConnection(dotServerChip, data.server_connected);
   robotStatus.textContent = data.robot_connected ? 'online' : 'offline';
   serverStatus.textContent = data.server_connected ? 'online' : 'offline';
 }
