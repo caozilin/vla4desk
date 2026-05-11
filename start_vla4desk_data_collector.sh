@@ -2,6 +2,7 @@
 # 启动 vla4desk 数据采集程序（遥操作）
 #
 # 用法：
+#   xhost +SI:localuser:root
 #   ./start_vla4desk_data_collector.sh --input_device keyboard
 #   ./start_vla4desk_data_collector.sh --input_device ps4
 #   ./start_vla4desk_data_collector.sh --task_name final_clean --input_device ps4

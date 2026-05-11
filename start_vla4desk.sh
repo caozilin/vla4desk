@@ -8,7 +8,7 @@
 #   ./start_vla4desk.sh --web_port 8080
 #   ./start_vla4desk.sh --host 100.96.2.67 --port 8000 --web_port 8081 --no_robot
 #   ./start_vla4desk.sh --log_subdir eval/robu
-#   ./start_vla4desk.sh --prompt "put the on the " --log_subdir eval/unseen/simple_recombination
+#   ./start_vla4desk.sh --prompt "put the strawberry into the cardboard box" --log_subdir eval/robust/env_camera_all
 #   ./start_vla4desk.sh --disable_async_chunk_replan
 #
 # 参数说明：
