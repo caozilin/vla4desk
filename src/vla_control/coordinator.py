@@ -47,15 +47,16 @@ class State(enum.Enum):
 
 @dataclasses.dataclass
 class Args:
-    host: str = "100.96.2.67"    # 云端推理服务 IP（openpi，Tailscale）
-    port: int = 8000             # 云端推理服务端口
+    host: str = "100.96.2.67"    # 远端推理服务 IP（Cosmos OpenPI 桥接 / openpi，Tailscale）
+    port: int = 8000             # 远端推理服务端口
     web_port: int = 8080         # 本地 Web 前端端口
     prompt: str = "pick up the object"  # 初始语言指令
     log_subdir: str = ""         # logs/ 下的可选子路径，空字符串保持时间戳命名
     cam1_serial: str | None = "346222072769"   # 外部相机 serial（主视角）
     cam2_serial: str | None = "938422075745"   # 腕部相机 serial
     api_key: str | None = None   # 推理服务 API key（若有）
-    replan_steps: int = 5        # 每次推理取几步 action 执行
+    replan_steps: int = 16       # 每次推理取几步 action 执行（Cosmos chunk_size=16）
+    action_transform: bool = False  # False=Cosmos 物理 delta；True=openpi 归一化 action 需 transform_action
     no_robot: bool = False       # 不启动 FrankaArm（机械臂未连接时使用）
     control_hz: float = 10.0     # 控制循环频率（Hz），与 skill loop 对齐
     disable_async_chunk_replan: bool = False  # 默认启用；传入该开关则关闭异步 action chunk 重规划
@@ -607,6 +608,17 @@ class Coordinator:
             "blend_weights": list(self._blend_weights),
         }
 
+    def _enqueue_policy_action(self, action: np.ndarray):
+        """将策略输出的 action 送入 FrankaEnv（Cosmos 用 transform=False）。"""
+        self._env.enqueue_action(
+            action,
+            transform=self._args.action_transform,
+            latest_only=self._args.async_latest_only if self._async_chunk_enabled else False,
+        )
+        if self._args.action_transform:
+            return transform_action(action)
+        return np.asarray(action, dtype=np.float64).copy()
+
     def _record_action_telemetry(self):
         with self._record_lock:
             if self._recording:
@@ -635,8 +647,7 @@ class Coordinator:
             return
 
         action = self._action_plan.popleft()
-        self._env.enqueue_action(action)
-        ta = transform_action(action)
+        ta = self._enqueue_policy_action(action)
 
         with self._telemetry_lock:
             self._latest_action = action.tolist()
@@ -681,8 +692,7 @@ class Coordinator:
                 action = self._current_chunk[self._chunk_exec_idx]
                 self._chunk_exec_idx += 1
 
-        self._env.enqueue_action(action, latest_only=self._args.async_latest_only)
-        ta = transform_action(action)
+        ta = self._enqueue_policy_action(action)
 
         with self._telemetry_lock:
             self._latest_action = action.tolist()
