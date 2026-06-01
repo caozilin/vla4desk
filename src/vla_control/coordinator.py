@@ -55,11 +55,11 @@ class Args:
     cam1_serial: str | None = "346222072769"   # 外部相机 serial（主视角）
     cam2_serial: str | None = "938422075745"   # 腕部相机 serial
     api_key: str | None = None   # 推理服务 API key（若有）
-    replan_steps: int = 16       # 每次推理取几步 action 执行（Cosmos chunk_size=16）
-    action_transform: bool = False  # False=Cosmos 物理 delta；True=openpi 归一化 action 需 transform_action
+    policy_type: str = "cosmos"   # 策略类型: "cosmos" 或 "openpi"
+    replan_steps: int | None = None  # 每次推理取几步 action 执行（None=根据 policy_type 自动设置）
     no_robot: bool = False       # 不启动 FrankaArm（机械臂未连接时使用）
     control_hz: float = 10.0     # 控制循环频率（Hz），与 skill loop 对齐
-    disable_async_chunk_replan: bool = False  # 默认启用；传入该开关则关闭异步 action chunk 重规划
+    disable_async_chunk_replan: bool = True  # 默认关闭；传入反向配置可开启异步 action chunk 重规划
     async_launch_after_steps: int = 2
     async_delay_steps_default: int = 3
     async_s_min: int = 2
@@ -69,6 +69,10 @@ class Args:
     async_use_measured_delay: bool = True
     async_delay_history_len: int = 20
     async_swap_immediately_when_ready: bool = True
+
+    def __post_init__(self):
+        if self.replan_steps is None:
+            self.replan_steps = 16 if self.policy_type == "cosmos" else 5
 
 
 class Coordinator:
@@ -105,6 +109,8 @@ class Coordinator:
         self._recording = False
         self._record_frames1: list[np.ndarray] = []
         self._record_frames2: list[np.ndarray] = []
+        self._record_frames3: list[np.ndarray] = []  # Cosmos: 未来腕部图像
+        self._record_frames4: list[np.ndarray] = []  # Cosmos: 未来主视角图像
         self._telemetry_log: collections.deque = collections.deque(maxlen=10800)
         self._session_dir: pathlib.Path | None = None
         self._record_start_time: float = 0.0
@@ -124,6 +130,12 @@ class Coordinator:
         self._latest_infer_ms: float | None = None
         self._latest_prev_total_ms: float | None = None
         self._latest_ee_force_torque: list | None = None
+        # Cosmos 特有字段
+        self._latest_value_prediction: float | None = None
+        self._latest_proprio: list | None = None
+        self._latest_future_proprio: list | None = None
+        self._latest_future_wrist: list | None = None
+        self._latest_future_primary: list | None = None
         self._telemetry_lock = threading.Lock()
 
         # WebSocket 客户端集合
@@ -247,6 +259,8 @@ class Coordinator:
         with self._record_lock:
             self._record_frames1.clear()
             self._record_frames2.clear()
+            self._record_frames3.clear()
+            self._record_frames4.clear()
             self._telemetry_log.clear()
             self._session_dir = self._allocate_session_dir()
             self._recording = True
@@ -258,9 +272,13 @@ class Coordinator:
             self._recording = False
             frames1 = self._record_frames1[:]
             frames2 = self._record_frames2[:]
+            frames3 = self._record_frames3[:]  # Cosmos: future wrist
+            frames4 = self._record_frames4[:]  # Cosmos: future primary
             tele_log = list(self._telemetry_log)
             self._record_frames1.clear()
             self._record_frames2.clear()
+            self._record_frames3.clear()
+            self._record_frames4.clear()
             self._telemetry_log.clear()
             session_dir = self._session_dir
             self._session_dir = None
@@ -269,15 +287,17 @@ class Coordinator:
             return
 
         try:
-            path1 = session_dir / "cam1.mp4"
-            path2 = session_dir / "cam2.mp4"
-            path_tele = session_dir / "telemetry.jsonl"
-
             fps = self._args.control_hz
-            imageio.mimwrite(str(path1), frames1, fps=fps, codec="libx264", pixelformat="yuv420p")
-            imageio.mimwrite(str(path2), frames2, fps=fps, codec="libx264", pixelformat="yuv420p")
+            imageio.mimwrite(str(session_dir / "cam1.mp4"), frames1, fps=fps, codec="libx264", pixelformat="yuv420p")
+            imageio.mimwrite(str(session_dir / "cam2.mp4"), frames2, fps=fps, codec="libx264", pixelformat="yuv420p")
 
-            with open(path_tele, "w") as f:
+            # Cosmos: 保存未来图像预测
+            if frames3:
+                imageio.mimwrite(str(session_dir / "cam3.mp4"), frames3, fps=fps, codec="libx264", pixelformat="yuv420p")
+            if frames4:
+                imageio.mimwrite(str(session_dir / "cam4.mp4"), frames4, fps=fps, codec="libx264", pixelformat="yuv420p")
+
+            with open(session_dir / "telemetry.jsonl", "w") as f:
                 for entry in tele_log:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -349,6 +369,15 @@ class Coordinator:
             if self._recording and img1_raw is not None and img2_raw is not None:
                 self._record_frames1.append(img1_raw.copy())
                 self._record_frames2.append(img2_raw.copy())
+                # Cosmos: 记录未来图像预测（每个 action 块对应的预测）
+                if self._args.policy_type == "cosmos":
+                    with self._telemetry_lock:
+                        fw = self._latest_future_wrist
+                        fp = self._latest_future_primary
+                    if fw is not None:
+                        self._record_frames3.append(np.array(fw).copy())
+                    if fp is not None:
+                        self._record_frames4.append(np.array(fp).copy())
 
     def _infer_action_plan_if_needed(self, obs: dict):
         if self._action_plan:
@@ -394,6 +423,23 @@ class Coordinator:
             delay_steps=delay_steps,
             pad_short=pad_short,
         )
+        # 提取 Cosmos 特有字段（仅当 policy_type == "cosmos" 时）
+        with self._telemetry_lock:
+            self._latest_infer_ms = infer_ms
+            self._latest_prev_total_ms = prev_total_ms
+            if self._args.policy_type == "cosmos":
+                self._latest_value_prediction = result.get("value_prediction")
+                self._latest_proprio = result.get("proprio")
+                self._latest_future_proprio = result.get("future_proprio")
+                future_images = result.get("future_images", {})
+                self._latest_future_wrist = future_images.get("wrist")
+                self._latest_future_primary = future_images.get("primary")
+            else:
+                self._latest_value_prediction = None
+                self._latest_proprio = None
+                self._latest_future_proprio = None
+                self._latest_future_wrist = None
+                self._latest_future_primary = None
         return chunk, infer_ms, prev_total_ms
 
     def _coerce_action_chunk(
@@ -409,7 +455,7 @@ class Coordinator:
         if arr.ndim != 2 or arr.shape[1] != 7:
             raise ValueError(f"Expected actions with shape (H, 7), got {arr.shape}")
 
-        target_len = max(1, int(self._args.replan_steps))
+        target_len = max(1, int(self._args.replan_steps or 16))
         start = max(0, int(delay_steps))
         if start >= len(arr):
             start = max(0, len(arr) - 1)
@@ -608,17 +654,6 @@ class Coordinator:
             "blend_weights": list(self._blend_weights),
         }
 
-    def _enqueue_policy_action(self, action: np.ndarray):
-        """将策略输出的 action 送入 FrankaEnv（Cosmos 用 transform=False）。"""
-        self._env.enqueue_action(
-            action,
-            transform=self._args.action_transform,
-            latest_only=self._args.async_latest_only if self._async_chunk_enabled else False,
-        )
-        if self._args.action_transform:
-            return transform_action(action)
-        return np.asarray(action, dtype=np.float64).copy()
-
     def _record_action_telemetry(self):
         with self._record_lock:
             if self._recording:
@@ -638,6 +673,11 @@ class Coordinator:
                     "inference_time_ms": self._latest_infer_ms,
                     "total_time_ms": self._latest_prev_total_ms,
                 }
+                # Cosmos 特有字段
+                if self._args.policy_type == "cosmos":
+                    entry["value_prediction"] = self._latest_value_prediction
+                    entry["proprio"] = self._latest_proprio
+                    entry["future_proprio"] = self._latest_future_proprio
                 entry.update(self._async_status_fields())
                 self._telemetry_log.append(entry)
 
@@ -647,7 +687,8 @@ class Coordinator:
             return
 
         action = self._action_plan.popleft()
-        ta = self._enqueue_policy_action(action)
+        self._env.enqueue_action(action)
+        ta = transform_action(action)
 
         with self._telemetry_lock:
             self._latest_action = action.tolist()
@@ -692,7 +733,8 @@ class Coordinator:
                 action = self._current_chunk[self._chunk_exec_idx]
                 self._chunk_exec_idx += 1
 
-        ta = self._enqueue_policy_action(action)
+        self._env.enqueue_action(action, latest_only=self._args.async_latest_only)
+        ta = transform_action(action)
 
         with self._telemetry_lock:
             self._latest_action = action.tolist()
@@ -719,6 +761,21 @@ class Coordinator:
             prompt = self._prompt
         with self._record_lock:
             session_dir = self._session_dir
+        with self._telemetry_lock:
+            value_prediction = self._latest_value_prediction
+            proprio = self._latest_proprio
+            future_proprio = self._latest_future_proprio
+            future_wrist = self._latest_future_wrist
+            future_primary = self._latest_future_primary
+
+        # 编码未来图像
+        future_wrist_b64 = None
+        future_primary_b64 = None
+        if future_wrist is not None:
+            future_wrist_b64 = _encode_jpeg_b64(np.array(future_wrist))
+        if future_primary is not None:
+            future_primary_b64 = _encode_jpeg_b64(np.array(future_primary))
+
         payload = {
             "controller_state": self._state.value,
             "recording": self._recording,
@@ -738,6 +795,13 @@ class Coordinator:
             "robot_connected": self._env._fa is not None,
             "server_connected": self._client is not None,
         }
+        # Cosmos 特有字段
+        if self._args.policy_type == "cosmos":
+            payload["value_prediction"] = value_prediction
+            payload["proprio"] = proprio
+            payload["future_proprio"] = future_proprio
+            payload["future_wrist"] = future_wrist_b64
+            payload["future_primary"] = future_primary_b64
         payload.update(self._async_status_fields())
         return json.dumps(payload)
 
@@ -834,7 +898,12 @@ def _display_log_path(path: pathlib.Path | None) -> str:
 # ------------------------------------------------------------------
 
 def build_app(coordinator: Coordinator) -> FastAPI:
-    STATIC_DIR = str(pathlib.Path(__file__).parent.parent.parent / "static")
+    policy_type = coordinator._args.policy_type
+    STATIC_DIR_BASE = pathlib.Path(__file__).parent.parent.parent / "static"
+    if policy_type == "cosmos":
+        STATIC_DIR = str(STATIC_DIR_BASE / "cosmos")
+    else:
+        STATIC_DIR = str(STATIC_DIR_BASE / "openpi")
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

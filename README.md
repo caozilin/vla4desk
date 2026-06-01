@@ -15,7 +15,10 @@ vla4desk/
 │   └── data_collection/
 │       └── TECHNICAL_DOC.md    # 数据采集技术文档
 ├── static/                 # Web 前端静态文件
-│   └── index.html
+│   ├── openpi/             # OpenPI 前端
+│   │   └── index.html
+│   └── cosmos/             # Cosmos 前端
+│       └── index.html
 └── requirements.txt
 ```
 

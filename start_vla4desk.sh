@@ -2,14 +2,16 @@
 # 启动 vla4desk 推理控制器
 #
 # 用法：
-#   ./start_vla4desk.sh
-#   ./start_vla4desk.sh --no_robot
-#   ./start_vla4desk.sh --host 100.96.2.67 --port 8000
-#   ./start_vla4desk.sh --web_port 8080
-#   ./start_vla4desk.sh --host 100.96.2.67 --port 8000 --web_port 8081 --no_robot
-#   ./start_vla4desk.sh --log_subdir eval/robu
-#   ./start_vla4desk.sh --prompt "put the strawberry into the cardboard box" --log_subdir eval/robust/env_camera_all
-#   ./start_vla4desk.sh --disable_async_chunk_replan
+#   openpi:
+#     ./start_vla4desk.sh --policy_type openpi
+#     ./start_vla4desk.sh --policy_type openpi --host 100.96.2.67 --port 8000 --web_port 8080
+#   cosmos:
+#     ./start_vla4desk.sh --policy_type cosmos
+#     ./start_vla4desk.sh --policy_type cosmos --host 100.96.2.67 --port 8000 --web_port 8080
+#   common:
+#     ./start_vla4desk.sh --no_robot
+#     ./start_vla4desk.sh --log_subdir eval/robu
+#     ./start_vla4desk.sh --prompt "put the strawberry into the cardboard box" --log_subdir eval/robust/env_camera_all
 #
 # 参数说明：
 #   --no_robot             不连接真实机器人（仿真模式）
@@ -18,7 +20,7 @@
 #   --web_port <port>      Web 界面端口（默认: 8080）
 #   --prompt <text>        初始语言指令（可在 Web 前端继续修改）
 #   --log_subdir <path>    logs/ 下的可选子路径；非空时保存为 epo_1、epo_2...
-#   --disable_async_chunk_replan        关闭默认启用的异步 chunk 重规划
+#   --disable_async_chunk_replan        关闭异步 chunk 重规划（默认已关闭）
 #
 # 说明：
 #   - 启动 vla4desk 推理控制器，连接 VLA 模型进行视觉-语言-动作推理

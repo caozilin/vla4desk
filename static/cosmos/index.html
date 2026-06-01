@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>VLA4Desk</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #101314;
+    --panel: #171c1e;
+    --panel-2: #1f2629;
+    --border: #2e3a3f;
+    --text: #eff6f2;
+    --muted: #8fa2a2;
+    --accent: #7ce0b8;
+    --warn: #f0b458;
+    --danger: #eb6b63;
+    --robot: #91a6ff;
+  }
+  body {
+    background:
+      radial-gradient(circle at top left, rgba(124, 224, 184, 0.12), transparent 32%),
+      radial-gradient(circle at top right, rgba(145, 166, 255, 0.10), transparent 28%),
+      var(--bg);
+    color: var(--text);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    padding: 18px;
+  }
+  h1 { font-size: 1.3rem; margin-bottom: 14px; color: #d5fff0; letter-spacing: 0.04em; }
+  .page { display: grid; gap: 14px; }
+  .panel {
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.00)), var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 12px;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+  }
+  .topbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr);
+    gap: 14px;
+    align-items: stretch;
+  }
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+    gap: 10px;
+  }
+  .summary-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
+    min-height: 78px;
+  }
+  .summary-label { font-size: 0.72rem; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .summary-value { font-size: 1rem; color: var(--text); font-weight: 700; }
+  .summary-sub { font-size: 0.74rem; color: var(--muted); margin-top: 6px; }
+  .state-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: #121719;
+    font-size: 0.92rem;
+    font-weight: 700;
+  }
+  .state-idle { color: #b2c4c4; }
+  .state-running { color: #98ffca; }
+  .state-homing { color: #9fb7ff; }
+  .record-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #3d4646;
+    box-shadow: 0 0 0 0 rgba(235, 107, 99, 0.4);
+  }
+  .record-dot.active {
+    background: var(--danger);
+    animation: pulse 1.2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(235, 107, 99, 0.50); }
+    70% { box-shadow: 0 0 0 8px rgba(235, 107, 99, 0.00); }
+    100% { box-shadow: 0 0 0 0 rgba(235, 107, 99, 0.00); }
+  }
+  .prompt-panel { display: grid; gap: 10px; }
+  .prompt-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .prompt-current {
+    min-height: 48px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: #e5f4ef;
+    line-height: 1.45;
+  }
+  .prompt-row { display: flex; gap: 8px; }
+  .text-input {
+    flex: 1;
+    padding: 10px 12px;
+    background: #111617;
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.92rem;
+    border-radius: 10px;
+  }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    padding: 9px 16px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    font-family: inherit;
+    transition: transform 120ms ease, opacity 120ms ease;
+  }
+  button:hover { transform: translateY(-1px); }
+  #btn-start  { background: #225d45; color: #fff; border-color: #2a8561; }
+  #btn-stop   { background: #632d2d; color: #fff; border-color: #8e4343; }
+  #btn-home   { background: #22385d; color: #fff; border-color: #365b93; }
+  #btn-send-prompt { background: #313c40; color: #eaf4f2; border-color: #47585f; }
+  #btn-send-log { background: #313c40; color: #eaf4f2; border-color: #47585f; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .conn-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #5d6668;
+  }
+  .conn-dot.on { background: var(--accent); }
+  .main-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.95fr);
+    gap: 14px;
+  }
+  .camera-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+    gap: 12px;
+    align-items: start;
+  }
+  .cam-stack {
+    display: grid;
+    gap: 12px;
+    align-content: start;
+  }
+  .cam-box label, .section-title, .metrics-title {
+    font-size: 0.75rem;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .cam-box img {
+    width: 100%;
+    border: 1px solid var(--border);
+    background: #000;
+    display: block;
+    border-radius: 12px;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+  }
+  .camera-main {
+    position: relative;
+    overflow: hidden;
+    border-radius: 12px;
+  }
+  .camera-overlay {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.74rem;
+    color: #e8f7f2;
+  }
+  .overlay-chip {
+    padding: 6px 8px;
+    border-radius: 999px;
+    background: rgba(10, 14, 15, 0.72);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .metrics-panel { display: grid; gap: 12px; }
+  .metrics-stack { display: grid; gap: 12px; }
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .metric-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
+  }
+  .metric-card.warn { border-color: rgba(240, 180, 88, 0.5); box-shadow: inset 0 0 0 1px rgba(240, 180, 88, 0.15); }
+  .metric-value {
+    font-size: 1.28rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .metric-sub {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 0.78rem;
+  }
+  .metric-block {
+    display: grid;
+    gap: 10px;
+  }
+  .value-bar-container {
+    width: 100%;
+    height: 8px;
+    background: var(--panel-2);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .value-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--robot));
+    transition: width 200ms ease;
+  }
+  .future-images {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  .future-img-box {
+    width: 100%;
+  }
+  .future-img-box img {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #000;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+  }
+  .future-img-box label {
+    font-size: 0.75rem;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  @media (max-width: 1200px) {
+    .topbar, .main-grid, .camera-panel, .telemetry { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 720px) {
+    body { padding: 12px; }
+    .summary, .metric-grid, .telemetry { grid-template-columns: 1fr; }
+    .prompt-row, .controls { flex-direction: column; }
+    button { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<h1>VLA4Desk</h1>
+
+<div class="page">
+  <div class="topbar">
+    <div class="panel">
+      <div class="summary">
+        <div class="summary-card">
+          <div class="summary-label">Controller</div>
+          <div class="summary-value"><span id="state-badge" class="state-pill state-idle">idle</span></div>
+          <div class="summary-sub">控制状态机</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Recording</div>
+          <div class="summary-value"><span id="rec-indicator" class="record-dot" title="录制中"></span> <span id="recording-text">IDLE</span></div>
+          <div class="summary-sub">自动会话记录</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Robot</div>
+          <div class="summary-value"><span class="conn-dot" id="dot-robot" title="机械臂"></span> <span id="robot-status">offline</span></div>
+          <div class="summary-sub">硬件连通性</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Policy Server</div>
+          <div class="summary-value"><span class="conn-dot" id="dot-server" title="推理服务"></span> <span id="server-status">offline</span></div>
+          <div class="summary-sub">推理链路</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel prompt-panel">
+      <div>
+        <div class="prompt-label">Current Prompt</div>
+        <div class="prompt-current" id="prompt-current">--</div>
+      </div>
+      <div class="prompt-row">
+        <input id="prompt-input" class="text-input" type="text" placeholder="输入语言指令..." value="">
+        <button id="btn-send-prompt" onclick="sendPrompt()">发送指令</button>
+      </div>
+      <div>
+        <div class="prompt-label">Log Subfolder</div>
+      </div>
+      <div class="prompt-row">
+        <input id="log-subdir-input" class="text-input" type="text" placeholder="eval/robu" value="">
+        <button id="btn-send-log" onclick="sendLogSubdir()">更新路径</button>
+      </div>
+      <div class="controls">
+        <button id="btn-start" onclick="cmd('start')">推理</button>
+        <button id="btn-stop" onclick="cmd('stop')">停止</button>
+        <button id="btn-home" onclick="cmd('home')">复位</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="main-grid">
+    <div class="panel camera-panel">
+      <div class="cam-box camera-main">
+        <label>External Camera</label>
+        <img id="img1" alt="cam1">
+        <div class="camera-overlay">
+          <div class="overlay-chip">Controller: <span id="overlay-state">idle</span></div>
+          <div class="overlay-chip">Prompt: <span id="overlay-prompt">--</span></div>
+        </div>
+      </div>
+      <div class="cam-stack">
+        <div class="cam-box">
+          <label>Wrist Camera</label>
+          <img id="img2" alt="cam2">
+        </div>
+        <div class="metric-block">
+          <div class="metrics-title">Future Images</div>
+          <div class="future-images">
+            <div class="future-img-box">
+              <label>Future Wrist</label>
+              <img id="future-wrist" alt="future wrist" src="">
+            </div>
+            <div class="future-img-box">
+              <label>Future Primary</label>
+              <img id="future-primary" alt="future primary" src="">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel metrics-panel">
+      <div class="metrics-stack">
+        <div class="metric-block">
+          <div class="metrics-title">System</div>
+          <div class="metric-grid">
+            <div class="metric-card" id="loop-card">
+              <div class="summary-label">Execution Window</div>
+              <div class="metric-value" id="loop-total-ms">--</div>
+              <div class="metric-sub">目标 300.0 ms</div>
+            </div>
+            <div class="metric-card">
+              <div class="summary-label">Loop Timing</div>
+              <div class="tele-row"><span class="tele-key">infer</span><span class="tele-val" id="tele-infer-ms">--</span></div>
+              <div class="tele-row"><span class="tele-key">total</span><span class="tele-val" id="tele-total-ms">--</span></div>
+              <div class="tele-row"><span class="tele-key">status</span><span class="tele-val" id="tele-loop-health">--</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="metric-block">
+          <div class="metrics-title">Cosmos Prediction</div>
+          <div class="metric-grid">
+            <div class="metric-card">
+              <div class="summary-label">Value Prediction</div>
+              <div class="metric-value" id="tele-value-pred">--</div>
+              <div class="value-bar-container">
+                <div class="value-bar" id="value-bar" style="width: 0%"></div>
+              </div>
+              <div class="metric-sub">成功置信度</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="metric-block">
+          <div class="metrics-title">Pose</div>
+          <div class="metric-grid">
+            <div class="metric-card" id="tele-state-box">
+              <div class="summary-label">Actual Pose</div>
+              <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-pos-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-pos-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-pos-z">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot x</span><span class="tele-val" id="tele-rot-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot y</span><span class="tele-val" id="tele-rot-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot z</span><span class="tele-val" id="tele-rot-z">—</span></div>
+              <div class="tele-row"><span class="tele-key">finger1</span><span class="tele-val" id="tele-grip1">—</span></div>
+              <div class="tele-row"><span class="tele-key">finger2</span><span class="tele-val" id="tele-grip2">—</span></div>
+            </div>
+            <div class="metric-card" id="tele-target-box">
+              <div class="summary-label">Commanded Pose</div>
+              <div class="tele-row"><span class="tele-key">pos x</span><span class="tele-val" id="tele-tpos-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos y</span><span class="tele-val" id="tele-tpos-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">pos z</span><span class="tele-val" id="tele-tpos-z">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot x</span><span class="tele-val" id="tele-trot-x">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot y</span><span class="tele-val" id="tele-trot-y">—</span></div>
+              <div class="tele-row"><span class="tele-key">rot z</span><span class="tele-val" id="tele-trot-z">—</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="metric-block">
+          <div class="metrics-title">Action</div>
+          <div class="metric-grid">
+          <div class="metric-card">
+            <div class="summary-label">Raw Action</div>
+            <div class="tele-row"><span class="tele-key">dx</span><span class="tele-val" id="tele-action-x">--</span></div>
+            <div class="tele-row"><span class="tele-key">dy</span><span class="tele-val" id="tele-action-y">--</span></div>
+            <div class="tele-row"><span class="tele-key">dz</span><span class="tele-val" id="tele-action-z">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot x</span><span class="tele-val" id="tele-action-rx">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot y</span><span class="tele-val" id="tele-action-ry">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot z</span><span class="tele-val" id="tele-action-rz">--</span></div>
+            <div class="tele-row"><span class="tele-key">gripper cmd</span><span class="tele-val" id="tele-agrip">--</span></div>
+          </div>
+          <div class="metric-card">
+            <div class="summary-label">Transformed Action</div>
+            <div class="tele-row"><span class="tele-key">dx</span><span class="tele-val" id="tele-action-t-x">--</span></div>
+            <div class="tele-row"><span class="tele-key">dy</span><span class="tele-val" id="tele-action-t-y">--</span></div>
+            <div class="tele-row"><span class="tele-key">dz</span><span class="tele-val" id="tele-action-t-z">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot x</span><span class="tele-val" id="tele-action-t-rx">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot y</span><span class="tele-val" id="tele-action-t-ry">--</span></div>
+            <div class="tele-row"><span class="tele-key">drot z</span><span class="tele-val" id="tele-action-t-rz">--</span></div>
+            <div class="tele-row"><span class="tele-key">gripper cmd</span><span class="tele-val" id="tele-tagrip">--</span></div>
+          </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const img1 = document.getElementById('img1');
+const img2 = document.getElementById('img2');
+const stateBadge = document.getElementById('state-badge');
+const recIndicator = document.getElementById('rec-indicator');
+const dotRobot = document.getElementById('dot-robot');
+const dotServer = document.getElementById('dot-server');
+const robotStatus = document.getElementById('robot-status');
+const serverStatus = document.getElementById('server-status');
+const recordingText = document.getElementById('recording-text');
+const promptCurrent = document.getElementById('prompt-current');
+const promptInput = document.getElementById('prompt-input');
+const logSubdirInput = document.getElementById('log-subdir-input');
+const overlayState = document.getElementById('overlay-state');
+const overlayPrompt = document.getElementById('overlay-prompt');
+const loopCard = document.getElementById('loop-card');
+const LOOP_TARGET_MS = 300.0;
+const LOOP_DANGER_MS = 260.0;
+let promptDirty = false;
+let logSubdirDirty = false;
+
+promptInput.addEventListener('input', () => { promptDirty = true; });
+logSubdirInput.addEventListener('input', () => { logSubdirDirty = true; });
+promptInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendPrompt();
+});
+logSubdirInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendLogSubdir();
+});
+
+// --- WebSocket 图像流 ---
+const ws = new WebSocket(`ws://${location.host}/ws/frames`);
+let lastTeleUpdate = 0;
+const TELE_UPDATE_INTERVAL = 100; // 遥测数据更新节流间隔（ms）
+
+ws.onmessage = (e) => {
+  const data = JSON.parse(e.data);
+  img1.src = 'data:image/jpeg;base64,' + data.img1;
+  img2.src = 'data:image/jpeg;base64,' + data.img2;
+
+  // 状态量 (State/Connection) 实时更新 (20Hz)
+  updateHeader(data);
+
+  // 数值量 (Telemetry) 节流更新，让肉眼能看清
+  const now = Date.now();
+  if (now - lastTeleUpdate > TELE_UPDATE_INTERVAL) {
+    updateTelemetry(data);
+    lastTeleUpdate = now;
+  }
+};
+ws.onclose = () => console.warn('WS closed');
+
+// --- 控制指令 ---
+async function cmd(action) {
+  if (action === 'start') {
+    await sendPrompt();
+    const ok = await sendLogSubdir();
+    if (!ok) return;
+  }
+  await fetch(`/cmd/${action}`, { method: 'POST' });
+  pollStatus();
+}
+
+async function sendPrompt() {
+  const prompt = promptInput.value;
+  await fetch('/cmd/prompt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  });
+  promptDirty = false;
+  promptCurrent.textContent = prompt || '--';
+  overlayPrompt.textContent = summarizePrompt(prompt);
+  return true;
+}
+
+async function sendLogSubdir() {
+  const log_subdir = logSubdirInput.value.trim();
+  const res = await fetch('/cmd/log_subdir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ log_subdir }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail || detail;
+    } catch (_) {}
+    alert(`Log path invalid: ${detail}`);
+    return false;
+  }
+  const data = await res.json();
+  logSubdirDirty = false;
+  logSubdirInput.value = data.log_subdir || '';
+  return true;
+}
+
+// --- 状态轮询 ---
+function updateBadge(state) {
+  stateBadge.textContent = state;
+  stateBadge.className = `state-pill state-${state}`;
+  overlayState.textContent = state || '--';
+}
+
+function summarizePrompt(prompt) {
+  if (!prompt) return '--';
+  return prompt.length > 48 ? prompt.slice(0, 45) + '...' : prompt;
+}
+
+function updateConnection(dot, on) {
+  dot.classList.toggle('on', !!on);
+}
+
+function updateHeader(data) {
+  if (data.controller_state) updateBadge(data.controller_state);
+
+  const recording = !!data.recording;
+  recIndicator.classList.toggle('active', recording);
+  recordingText.textContent = recording ? 'REC' : 'IDLE';
+
+  const prompt = data.prompt ?? '';
+  promptCurrent.textContent = prompt || '--';
+  overlayPrompt.textContent = summarizePrompt(prompt);
+  if (!promptDirty && document.activeElement !== promptInput) {
+    promptInput.value = prompt;
+  }
+
+  if (data.log_subdir != null) {
+    if (!logSubdirDirty && document.activeElement !== logSubdirInput) {
+      logSubdirInput.value = data.log_subdir || '';
+    }
+  }
+
+  updateConnection(dotRobot, data.robot_connected);
+  updateConnection(dotServer, data.server_connected);
+  robotStatus.textContent = data.robot_connected ? 'online' : 'offline';
+  serverStatus.textContent = data.server_connected ? 'online' : 'offline';
+}
+
+function setText(el, val) {
+  if (!el) return;
+  if (el.textContent === val) return;
+  el.textContent = val;
+}
+
+function setValue(el, val, opts = {}) {
+  if (!el) return;
+  const next = String(val);
+  const changed = el.textContent !== next;
+  el.textContent = next;
+  el.classList.toggle('changed', changed);
+  el.classList.toggle('warn', !!opts.warn);
+  el.classList.toggle('danger', !!opts.danger);
+}
+
+// --- 元素缓存 ---
+const teleEls = {
+  posX: document.getElementById('tele-pos-x'),
+  posY: document.getElementById('tele-pos-y'),
+  posZ: document.getElementById('tele-pos-z'),
+  rotX: document.getElementById('tele-rot-x'),
+  rotY: document.getElementById('tele-rot-y'),
+  rotZ: document.getElementById('tele-rot-z'),
+  grip1: document.getElementById('tele-grip1'),
+  grip2: document.getElementById('tele-grip2'),
+  agrip: document.getElementById('tele-agrip'),
+  tagrip: document.getElementById('tele-tagrip'),
+  tposX: document.getElementById('tele-tpos-x'),
+  tposY: document.getElementById('tele-tpos-y'),
+  tposZ: document.getElementById('tele-tpos-z'),
+  trotX: document.getElementById('tele-trot-x'),
+  trotY: document.getElementById('tele-trot-y'),
+  trotZ: document.getElementById('tele-trot-z'),
+  inferMs: document.getElementById('tele-infer-ms'),
+  totalMs: document.getElementById('tele-total-ms'),
+  loopHealth: document.getElementById('tele-loop-health'),
+  actionX: document.getElementById('tele-action-x'),
+  actionY: document.getElementById('tele-action-y'),
+  actionZ: document.getElementById('tele-action-z'),
+  actionRx: document.getElementById('tele-action-rx'),
+  actionRy: document.getElementById('tele-action-ry'),
+  actionRz: document.getElementById('tele-action-rz'),
+  actionTX: document.getElementById('tele-action-t-x'),
+  actionTY: document.getElementById('tele-action-t-y'),
+  actionTZ: document.getElementById('tele-action-t-z'),
+  actionTRx: document.getElementById('tele-action-t-rx'),
+  actionTRy: document.getElementById('tele-action-t-ry'),
+  actionTRz: document.getElementById('tele-action-t-rz'),
+  loopTotalMs: document.getElementById('loop-total-ms'),
+  stateBox: document.getElementById('tele-state-box'),
+  targetBox: document.getElementById('tele-target-box'),
+  valuePred: document.getElementById('tele-value-pred'),
+  valueBar: document.getElementById('value-bar'),
+};
+
+function updateTelemetry(data) {
+  const fmt = (v) => v.toFixed(4);
+  const fmtMs = (v) => v.toFixed(1) + ' ms';
+  const totalMs = data.total_ms;
+  const overBudget = totalMs != null && totalMs > LOOP_TARGET_MS;
+
+  teleEls.stateBox.style.display = data.robot_connected ? '' : 'none';
+  teleEls.targetBox.style.display = data.robot_connected ? '' : 'none';
+
+  if (data.robot_connected && data.state) {
+    const s = data.state;
+    setValue(teleEls.posX, fmt(s[0]));
+    setValue(teleEls.posY, fmt(s[1]));
+    setValue(teleEls.posZ, fmt(s[2]));
+    setValue(teleEls.rotX, fmt(s[3]));
+    setValue(teleEls.rotY, fmt(s[4]));
+    setValue(teleEls.rotZ, fmt(s[5]));
+    setValue(teleEls.grip1, fmt(s[6]));
+    setValue(teleEls.grip2, fmt(s[7]));
+  }
+  if (data.robot_connected && data.target_pose) {
+    const tp = data.target_pose;
+    setValue(teleEls.tposX, fmt(tp[0]));
+    setValue(teleEls.tposY, fmt(tp[1]));
+    setValue(teleEls.tposZ, fmt(tp[2]));
+    setValue(teleEls.trotX, fmt(tp[3]));
+    setValue(teleEls.trotY, fmt(tp[4]));
+    setValue(teleEls.trotZ, fmt(tp[5]));
+  }
+  if (data.server_connected && data.action_raw) {
+    const a = data.action_raw;
+    setValue(teleEls.actionX, fmt(a[0]), { warn: Math.abs(a[0]) > 0.01 });
+    setValue(teleEls.actionY, fmt(a[1]), { warn: Math.abs(a[1]) > 0.01 });
+    setValue(teleEls.actionZ, fmt(a[2]), { warn: Math.abs(a[2]) > 0.01 });
+    setValue(teleEls.actionRx, fmt(a[3]), { warn: Math.abs(a[3]) > 0.05 });
+    setValue(teleEls.actionRy, fmt(a[4]), { warn: Math.abs(a[4]) > 0.05 });
+    setValue(teleEls.actionRz, fmt(a[5]), { warn: Math.abs(a[5]) > 0.05 });
+    setValue(teleEls.agrip, fmt(a[6]));
+  }
+  if (data.server_connected && data.action_transformed) {
+    const ta = data.action_transformed;
+    setValue(teleEls.actionTX, fmt(ta[0]));
+    setValue(teleEls.actionTY, fmt(ta[1]));
+    setValue(teleEls.actionTZ, fmt(ta[2]));
+    setValue(teleEls.actionTRx, fmt(ta[3]));
+    setValue(teleEls.actionTRy, fmt(ta[4]));
+    setValue(teleEls.actionTRz, fmt(ta[5]));
+    setValue(teleEls.tagrip, fmt(ta[6]));
+  }
+  if (data.infer_ms != null) {
+    setValue(teleEls.inferMs, fmtMs(data.infer_ms), { warn: data.infer_ms > 70.0 });
+  }
+  if (data.total_ms != null) {
+    setValue(teleEls.totalMs, fmtMs(data.total_ms), { warn: data.total_ms > LOOP_TARGET_MS, danger: data.total_ms > LOOP_DANGER_MS });
+    setValue(teleEls.loopTotalMs, fmtMs(data.total_ms), { warn: overBudget, danger: data.total_ms > LOOP_DANGER_MS });
+    setValue(teleEls.loopHealth, overBudget ? 'over budget' : 'stable', { warn: overBudget, danger: data.total_ms > LOOP_DANGER_MS });
+  }
+  loopCard.classList.toggle('warn', overBudget);
+
+  // Cosmos 特有字段
+  if (data.value_prediction != null) {
+    const vp = data.value_prediction;
+    setValue(teleEls.valuePred, vp.toFixed(3));
+    const pct = (vp * 100).toFixed(0) + '%';
+    teleEls.valueBar.style.width = pct;
+    teleEls.valueBar.style.opacity = vp > 0.5 ? '1' : '0.6';
+  } else {
+    setValue(teleEls.valuePred, '--');
+    teleEls.valueBar.style.width = '0%';
+  }
+
+  if (data.future_wrist) {
+    document.getElementById('future-wrist').src = 'data:image/jpeg;base64,' + data.future_wrist;
+  }
+  if (data.future_primary) {
+    document.getElementById('future-primary').src = 'data:image/jpeg;base64,' + data.future_primary;
+  }
+}
+
+async function pollStatus() {
+  const res = await fetch('/status');
+  const data = await res.json();
+  updateHeader(data);
+
+  // 如果 WS 没开，则由轮询驱动数据更新
+  if (ws.readyState !== WebSocket.OPEN) {
+    updateTelemetry(data);
+  }
+}
+
+setInterval(pollStatus, 333);
+pollStatus();
+</script>
+</body>
+</html>
